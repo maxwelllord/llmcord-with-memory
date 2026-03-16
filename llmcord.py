@@ -238,7 +238,7 @@ async def populate_node(node: MsgNode, msg: discord.Message) -> None:
             node.text = node.text.split("\n", 1)[-1] if "\n" in node.text else ""
 
     if node.role == "user" and (node.text or node.images):
-        node.text = f"<@{msg.author.id}>: {node.text}"
+        node.text = f"{msg.author.display_name} (<@{msg.author.id}>): {node.text}"
 
     if msg.reactions:
         reaction_strs = [f"{r.emoji} x{r.count}" for r in msg.reactions]
