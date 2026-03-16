@@ -3,6 +3,7 @@ from base64 import b64encode
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import io
+import json
 import logging
 from typing import Any, Literal, Optional
 
@@ -15,6 +16,10 @@ from discord.ui import LayoutView, TextDisplay
 import httpx
 from openai import AsyncOpenAI
 import yaml
+
+from anthropic import AsyncAnthropic
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
 
 from memory import memory_store, check_and_run_memory_sweep, collect_since_last_sweep, run_memory_sweep
 from semantic_memory import load_core_memory, retrieve_memories
@@ -101,6 +106,82 @@ activity = discord.CustomActivity(name=(config.get("status_message") or "github.
 discord_bot = commands.Bot(intents=intents, activity=activity, command_prefix=None)
 
 httpx_client = httpx.AsyncClient()
+
+
+# ---------------------------------------------------------------------------
+# MCP Client
+# ---------------------------------------------------------------------------
+
+class MCPClient:
+    """Manages persistent connection to local MCP server."""
+
+    def __init__(self):
+        self.session: Optional[ClientSession] = None
+        self.tools: list[dict] = []
+        self.initialized = asyncio.Event()
+        self._error: Optional[str] = None
+
+    async def start(self, server_params: StdioServerParameters) -> None:
+        """Start and maintain MCP connection (run as background task)."""
+        try:
+            async with stdio_client(server_params) as (read, write):
+                async with ClientSession(read, write) as session:
+                    self.session = session
+                    await session.initialize()
+
+                    # List available tools
+                    tools_result = await session.list_tools()
+                    self.tools = self._convert_tools_to_anthropic(tools_result.tools)
+
+                    logging.info(f"MCP client connected with {len(self.tools)} tools: {[t['name'] for t in self.tools]}")
+                    self.initialized.set()
+
+                    # Keep connection alive
+                    await asyncio.Event().wait()
+        except Exception as e:
+            self._error = str(e)
+            logging.exception("MCP client failed to start")
+            self.initialized.set()  # Unblock waiters even on error
+
+    def _convert_tools_to_anthropic(self, mcp_tools) -> list[dict]:
+        """Convert MCP tool definitions to Anthropic format."""
+        return [
+            {
+                "name": tool.name,
+                "description": tool.description or "",
+                "input_schema": tool.inputSchema,
+            }
+            for tool in mcp_tools
+        ]
+
+    async def call_tool(self, name: str, tool_input: dict) -> str:
+        """Call an MCP tool and return the result as string."""
+        if not self.session:
+            return "Error: MCP session not available"
+
+        try:
+            result = await self.session.call_tool(name, tool_input)
+
+            # Convert result to string
+            if result.content:
+                parts = []
+                for item in result.content:
+                    if hasattr(item, 'text'):
+                        parts.append(item.text)
+                    else:
+                        parts.append(str(item))
+                return "\n".join(parts)
+            return "Tool executed successfully (no output)"
+        except Exception as e:
+            logging.exception(f"Error calling MCP tool {name}")
+            return f"Error calling tool: {str(e)}"
+
+    def is_ready(self) -> bool:
+        """Check if MCP client is ready to use."""
+        return self.session is not None and self._error is None
+
+
+mcp_client = MCPClient()
 
 
 @dataclass
@@ -789,6 +870,25 @@ async def on_ready() -> None:
 
     await discord_bot.tree.sync()
 
+    # Start MCP client
+    mcp_cfg = config.get("mcp", {})
+    if mcp_cfg.get("enabled", False):
+        logging.info("Starting MCP client...")
+        mcp_server_params = StdioServerParameters(
+            command=mcp_cfg.get("command", "python"),
+            args=mcp_cfg.get("args", []),
+            env=mcp_cfg.get("env"),
+        )
+        asyncio.create_task(mcp_client.start(mcp_server_params))
+        await mcp_client.initialized.wait()
+
+        if mcp_client.is_ready():
+            logging.info("MCP client ready!")
+        else:
+            logging.warning(f"MCP client failed to initialize: {mcp_client._error}")
+    else:
+        logging.info("MCP disabled in config")
+
 
 @discord_bot.event
 async def on_message(new_msg: discord.Message) -> None:
@@ -912,19 +1012,39 @@ async def on_message(new_msg: discord.Message) -> None:
 
         # --- System prompt & message ordering ---
         ordered_messages = messages[::-1] if is_dm else messages
-        if system_prompt := build_system_prompt(cfg):
-            ordered_messages.insert(0, dict(role="system", content=system_prompt))
-
-        # --- Stream response ---
-        openai_kwargs = dict(model=model, messages=ordered_messages, stream=True, extra_headers=extra_headers, extra_query=extra_query, extra_body=extra_body)
+        system_prompt = build_system_prompt(cfg)
 
         earliest_timestamp = int(earliest_msg_time.timestamp())
         context_info = f"🌞 Earliest message: <t:{earliest_timestamp}:t>"
         use_plain_responses = cfg.get("use_plain_responses", False)
 
-        response_msgs, full_response = await stream_response(
-            new_msg, openai_client, openai_kwargs, user_warnings, context_info, use_plain_responses,
-        )
+        # --- Stream response ---
+        # Use Anthropic SDK for Anthropic provider, OpenAI SDK for others
+        if provider == "anthropic":
+            # Use Anthropic SDK with MCP tools
+            anthropic_client = AsyncAnthropic(api_key=provider_config.get("api_key"))
+
+            # Get MCP tools if available
+            tools = mcp_client.tools if mcp_client.is_ready() else []
+
+            # Extract model parameters
+            max_tokens = model_parameters.get("max_tokens", 4096) if model_parameters else 4096
+            temperature = model_parameters.get("temperature", 1.0) if model_parameters else 1.0
+
+            response_msgs, full_response = await stream_response_anthropic(
+                new_msg, anthropic_client, model, ordered_messages, system_prompt,
+                tools, max_tokens, temperature, user_warnings, context_info, use_plain_responses,
+            )
+        else:
+            # Use OpenAI SDK for other providers
+            if system_prompt:
+                ordered_messages.insert(0, dict(role="system", content=system_prompt))
+
+            openai_kwargs = dict(model=model, messages=ordered_messages, stream=True, extra_headers=extra_headers, extra_query=extra_query, extra_body=extra_body)
+
+            response_msgs, full_response = await stream_response(
+                new_msg, openai_client, openai_kwargs, user_warnings, context_info, use_plain_responses,
+            )
 
         # --- Finalize response nodes ---
         for response_msg in response_msgs:
@@ -939,6 +1059,272 @@ async def on_message(new_msg: discord.Message) -> None:
 
     # --- Cleanup old nodes ---
     await cleanup_old_nodes()
+
+
+# ---------------------------------------------------------------------------
+# Anthropic message format conversion
+# ---------------------------------------------------------------------------
+
+def convert_messages_for_anthropic(messages: list[dict]) -> list[dict]:
+    """Convert OpenAI-format messages to Anthropic format.
+
+    Handles:
+    - image_url blocks -> Anthropic image blocks with base64 source
+    - Merging consecutive same-role messages (Anthropic requires alternation)
+    - Skipping system messages (handled separately by Anthropic API)
+    """
+    result: list[dict] = []
+
+    for msg in messages:
+        role = msg["role"]
+        content = msg["content"]
+
+        if role == "system":
+            continue
+
+        # Convert content
+        if isinstance(content, str):
+            anthropic_content = content
+        elif isinstance(content, list):
+            anthropic_content = []
+            for part in content:
+                if part.get("type") == "text":
+                    anthropic_content.append({"type": "text", "text": part["text"]})
+                elif part.get("type") == "image_url":
+                    url = part["image_url"]["url"]
+                    if url.startswith("data:"):
+                        header, data = url.split(",", 1)
+                        media_type = header.split(":")[1].split(";")[0]
+                        anthropic_content.append({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": data,
+                            },
+                        })
+            if not anthropic_content:
+                continue
+        else:
+            continue
+
+        # Merge with previous message if same role
+        if result and result[-1]["role"] == role:
+            prev = result[-1]["content"]
+            if isinstance(prev, str) and isinstance(anthropic_content, str):
+                result[-1]["content"] = prev + "\n" + anthropic_content
+            else:
+                prev_list = [{"type": "text", "text": prev}] if isinstance(prev, str) else prev
+                new_list = [{"type": "text", "text": anthropic_content}] if isinstance(anthropic_content, str) else anthropic_content
+                result[-1]["content"] = prev_list + new_list
+        else:
+            result.append({"role": role, "content": anthropic_content})
+
+    # Anthropic requires first message to be "user"
+    if result and result[0]["role"] != "user":
+        result.insert(0, {"role": "user", "content": "(conversation context)"})
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Anthropic streaming with tool support
+# ---------------------------------------------------------------------------
+
+async def stream_response_anthropic(
+    new_msg: discord.Message,
+    anthropic_client: AsyncAnthropic,
+    model: str,
+    messages: list[dict],
+    system: Optional[str],
+    tools: list[dict],
+    max_tokens: int,
+    temperature: float,
+    user_warnings: set[str],
+    context_info: str,
+    use_plain_responses: bool,
+) -> tuple[list[discord.Message], str]:
+    """Stream response from Anthropic with MCP tool support. Returns (response_msgs, full_text)."""
+    global last_task_time
+
+    response_msgs: list[discord.Message] = []
+    response_contents: list[str] = []
+
+    if use_plain_responses:
+        max_message_length = 4000
+    else:
+        max_message_length = 4096 - len(STREAMING_INDICATOR)
+        fields = [dict(name=warning, value="", inline=False) for warning in sorted(user_warnings)]
+        fields.append(dict(name=context_info, value="", inline=False))
+        embed = discord.Embed.from_dict(dict(fields=fields))
+        first_embed_sent = False
+
+    async def reply_helper(**reply_kwargs) -> None:
+        reply_target = new_msg if not response_msgs else response_msgs[-1]
+        response_msg = await reply_target.reply(**reply_kwargs)
+        response_msgs.append(response_msg)
+
+        msg_nodes[response_msg.id] = MsgNode(parent_msg=new_msg)
+        await msg_nodes[response_msg.id].lock.acquire()
+
+    active_channels.add(new_msg.channel.id)
+
+    try:
+        # Convert messages to Anthropic format
+        conversation_messages = convert_messages_for_anthropic(messages)
+
+        iteration = 0
+        max_iterations = 10
+
+        while iteration < max_iterations:
+            iteration += 1
+            tool_uses: list[dict] = []
+            iteration_text = ""  # Text produced in this iteration only
+
+            # Build API kwargs, only including system/tools when present
+            create_kwargs: dict[str, Any] = dict(
+                model=model,
+                messages=conversation_messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                stream=True,
+            )
+            if system:
+                create_kwargs["system"] = system
+            if tools:
+                create_kwargs["tools"] = tools
+
+            async with new_msg.channel.typing():
+                stream = await anthropic_client.messages.create(**create_kwargs)
+
+                async for event in stream:
+                    if event.type == "content_block_start":
+                        if event.content_block.type == "tool_use":
+                            tool_uses.append({
+                                "id": event.content_block.id,
+                                "name": event.content_block.name,
+                                "input_json": "",
+                            })
+
+                    elif event.type == "content_block_delta":
+                        if event.delta.type == "text_delta":
+                            chunk = event.delta.text
+                            iteration_text += chunk
+
+                            # Append chunk to response_contents
+                            if not response_contents:
+                                response_contents.append("")
+
+                            # Start new Discord message if current one would overflow
+                            if len(response_contents[-1]) + len(chunk) > max_message_length:
+                                # Finalize current message
+                                if not use_plain_responses and response_msgs:
+                                    embed.description = response_contents[-1]
+                                    embed.color = EMBED_COLOR_COMPLETE
+                                    await response_msgs[-1].edit(embed=embed)
+
+                                response_contents.append("")
+                                # Force new Discord message on next update
+                                start_new_msg = True
+                            else:
+                                start_new_msg = not response_contents[-1] and not response_msgs
+
+                            response_contents[-1] += chunk
+
+                            # Update Discord embed periodically
+                            if not use_plain_responses:
+                                time_delta = datetime.now().timestamp() - last_task_time
+
+                                if time_delta >= EDIT_DELAY_SECONDS or start_new_msg:
+                                    embed.description = response_contents[-1] + STREAMING_INDICATOR
+                                    embed.color = EMBED_COLOR_INCOMPLETE
+
+                                    if start_new_msg or len(response_msgs) < len(response_contents):
+                                        await reply_helper(embed=embed, silent=True)
+                                        if not first_embed_sent:
+                                            embed.clear_fields()
+                                            first_embed_sent = True
+                                    else:
+                                        await response_msgs[-1].edit(embed=embed)
+
+                                    last_task_time = datetime.now().timestamp()
+
+                        elif event.delta.type == "input_json_delta":
+                            if tool_uses:
+                                tool_uses[-1]["input_json"] += event.delta.partial_json
+
+            # Parse accumulated JSON inputs for tool calls
+            for tool_use in tool_uses:
+                raw = tool_use.pop("input_json")
+                try:
+                    tool_use["input"] = json.loads(raw) if raw else {}
+                except json.JSONDecodeError:
+                    tool_use["input"] = {}
+
+            # Finalize current text in embed (mark complete or in-progress)
+            if not use_plain_responses and response_contents and response_contents[-1] and response_msgs:
+                embed.description = response_contents[-1]
+                embed.color = EMBED_COLOR_COMPLETE if not tool_uses else EMBED_COLOR_INCOMPLETE
+                await response_msgs[-1].edit(embed=embed)
+
+            # If no tool uses, we're done
+            if not tool_uses:
+                break
+
+            # Execute MCP tools
+            logging.info(f"Executing {len(tool_uses)} MCP tools: {[t['name'] for t in tool_uses]}")
+
+            # Build assistant message with text + tool_use blocks
+            assistant_content = []
+            if iteration_text:
+                assistant_content.append({"type": "text", "text": iteration_text})
+            for tool_use in tool_uses:
+                assistant_content.append({
+                    "type": "tool_use",
+                    "id": tool_use["id"],
+                    "name": tool_use["name"],
+                    "input": tool_use["input"],
+                })
+
+            conversation_messages.append({"role": "assistant", "content": assistant_content})
+
+            # Call MCP tools and collect results
+            tool_results = []
+            for tool_use in tool_uses:
+                result = await mcp_client.call_tool(tool_use["name"], tool_use["input"])
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tool_use["id"],
+                    "content": result,
+                })
+
+            conversation_messages.append({"role": "user", "content": tool_results})
+
+        # Send plain response messages if needed
+        if use_plain_responses and response_contents:
+            for i, content in enumerate(response_contents):
+                if i == 0:
+                    content = f"-# {context_info}\n{content}"
+                await reply_helper(view=LayoutView().add_item(TextDisplay(content=content)))
+
+    except Exception as e:
+        logging.exception("Error while generating Anthropic response")
+        if not response_msgs:
+            error_type = type(e).__name__
+            error_brief = str(e).split("\n")[0][:200] if str(e) else "Unknown error"
+            error_text = f"⚠️ **{error_type}**: {error_brief}"
+            try:
+                if use_plain_responses:
+                    await reply_helper(view=LayoutView().add_item(TextDisplay(content=error_text)))
+                else:
+                    error_embed = discord.Embed(description=error_text, color=EMBED_COLOR_INCOMPLETE)
+                    await reply_helper(embed=error_embed, silent=True)
+            except Exception:
+                logging.exception("Error while sending error message")
+
+    active_channels.discard(new_msg.channel.id)
+    full_text = "".join(response_contents)
+    return response_msgs, full_text
 
 
 async def main() -> None:
