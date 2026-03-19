@@ -23,6 +23,7 @@ from mcp.client.stdio import stdio_client
 
 from memory import memory_store, check_and_run_memory_sweep, collect_since_last_sweep, run_memory_sweep
 from semantic_memory import load_core_memory, retrieve_memories
+from turn_logger import log_message_turn
 
 logging.basicConfig(
     level=logging.INFO,
@@ -507,27 +508,62 @@ async def build_chain_channel(
     warnings: set[str] = set()
 
     context_gap_minutes = cfg.get("context_gap_minutes", 10)
+    context_bridge_tokens = cfg.get("context_bridge_tokens", 1000)
 
     recent_msgs: list[discord.Message] = []
+    bridge_msgs: list[discord.Message] = []
     estimated_tokens = 0
     prev_msg_time = new_msg.created_at
+    gap_found = False
+    gap_minutes = 0
+    bridge_tokens = 0
 
     async for msg in new_msg.channel.history(limit=MAX_MESSAGES, before=new_msg):
         if msg.type not in (discord.MessageType.default, discord.MessageType.reply):
             continue
 
-        time_gap = (prev_msg_time - msg.created_at).total_seconds() / 60
-        if time_gap > context_gap_minutes:
-            break
+        if not gap_found:
+            time_gap = (prev_msg_time - msg.created_at).total_seconds() / 60
+            if time_gap > context_gap_minutes:
+                gap_found = True
+                gap_minutes = time_gap
+            else:
+                msg_tokens = estimate_tokens(msg.content)
+                if estimated_tokens + msg_tokens > max_context_tokens:
+                    break
+                estimated_tokens += msg_tokens
+                recent_msgs.append(msg)
+                prev_msg_time = msg.created_at
+                continue
 
+        # Collecting bridge messages (gap was found)
+        if context_bridge_tokens <= 0:
+            break
         msg_tokens = estimate_tokens(msg.content)
-        if estimated_tokens + msg_tokens > max_context_tokens:
+        if bridge_tokens + msg_tokens > context_bridge_tokens:
             break
+        bridge_tokens += msg_tokens
+        bridge_msgs.append(msg)
 
-        estimated_tokens += msg_tokens
-        recent_msgs.append(msg)
-        prev_msg_time = msg.created_at
+    # Build bridge messages (oldest first)
+    for msg in reversed(bridge_msgs):
+        node = msg_nodes.setdefault(msg.id, MsgNode())
+        async with node.lock:
+            await populate_node(node, msg)
+        result, w = build_message_content(node, max_text, max_images, nodes_needing_descriptions)
+        warnings |= w
+        if result:
+            messages.append(result)
 
+    # Insert separator between bridge and current context
+    if bridge_msgs:
+        gap_label = f"{int(gap_minutes)} minutes" if gap_minutes < 120 else f"{gap_minutes / 60:.1f} hours"
+        messages.append(dict(
+            role="user",
+            content=f"--- Earlier context (before a gap of {gap_label}) ---",
+        ))
+
+    # Build current context messages
     for msg in reversed(recent_msgs):
         node = msg_nodes.setdefault(msg.id, MsgNode())
         async with node.lock:
@@ -784,35 +820,52 @@ async def info_command(interaction: discord.Interaction) -> None:
     cfg = await asyncio.to_thread(get_config)
     context_gap_minutes = cfg.get("context_gap_minutes", 10)
     max_context_tokens = cfg.get("max_context_tokens", 10000)
+    context_bridge_tokens = cfg.get("context_bridge_tokens", 1000)
 
     channel = interaction.channel
     estimated_tokens = 0
     msg_count = 0
+    bridge_count = 0
+    bridge_tokens = 0
     prev_msg_time = datetime.now(timezone.utc)
     earliest_time = prev_msg_time
+    gap_found = False
 
     async for msg in channel.history(limit=MAX_MESSAGES):
         if msg.type not in (discord.MessageType.default, discord.MessageType.reply):
             continue
 
-        time_gap = (prev_msg_time - msg.created_at).total_seconds() / 60
-        if msg_count > 0 and time_gap > context_gap_minutes:
-            break
+        if not gap_found:
+            time_gap = (prev_msg_time - msg.created_at).total_seconds() / 60
+            if msg_count > 0 and time_gap > context_gap_minutes:
+                gap_found = True
+            else:
+                msg_tokens = estimate_tokens(msg.content)
+                if msg_count > 0 and estimated_tokens + msg_tokens > max_context_tokens:
+                    break
+                estimated_tokens += msg_tokens
+                msg_count += 1
+                earliest_time = msg.created_at
+                prev_msg_time = msg.created_at
+                continue
 
+        # Bridge messages
+        if context_bridge_tokens <= 0:
+            break
         msg_tokens = estimate_tokens(msg.content)
-        if msg_count > 0 and estimated_tokens + msg_tokens > max_context_tokens:
+        if bridge_tokens + msg_tokens > context_bridge_tokens:
             break
-
-        estimated_tokens += msg_tokens
-        msg_count += 1
+        bridge_tokens += msg_tokens
+        bridge_count += 1
         earliest_time = msg.created_at
-        prev_msg_time = msg.created_at
 
+    total_tokens = estimated_tokens + bridge_tokens
     earliest_ts = int(earliest_time.timestamp())
+    bridge_info = f"\nBridge messages: {bridge_count} (~{int(bridge_tokens):,} tokens)" if bridge_count else ""
     await interaction.response.send_message(
         f"**Context estimate:**\n"
-        f"Messages: {msg_count}\n"
-        f"Estimated tokens: ~{int(estimated_tokens):,}\n"
+        f"Messages: {msg_count}{bridge_info}\n"
+        f"Estimated tokens: ~{int(total_tokens):,}\n"
         f"Earliest message: <t:{earliest_ts}:R>\n"
         f"Max context tokens: {max_context_tokens:,}",
         ephemeral=True,
@@ -1054,6 +1107,17 @@ async def on_message(new_msg: discord.Message) -> None:
             response_msgs, full_response = await stream_response(
                 new_msg, openai_client, openai_kwargs, user_warnings, context_info, use_plain_responses,
             )
+
+        # --- Log the full turn ---
+        try:
+            log_message_turn(
+                model=provider_slash_model,
+                system_prompt=system_prompt,
+                messages=ordered_messages,
+                response_text=full_response,
+            )
+        except Exception:
+            logging.exception("Failed to write turn log")
 
         # --- Finalize response nodes ---
         for response_msg in response_msgs:

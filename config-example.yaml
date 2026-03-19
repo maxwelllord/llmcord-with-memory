@@ -14,6 +14,7 @@ allow_dms: true
 # Recent channel history settings (non-thread, non-DM):
 context_gap_minutes: 10
 max_context_tokens: 10000
+context_bridge_tokens: 1000
 
 # Interjection: use a small model to decide if the bot should respond without being @mentioned.
 # Omit or leave blank to only respond when @mentioned (default behavior).
@@ -96,3 +97,52 @@ system_prompt: |
   Today's date is {date}. The current time is {time}.
 
   User messages are prefixed with their Discord ID as <@ID>. Use this format to mention users.
+
+sweep_prompt: |
+  You are Claude. You are performing a memory review after a Discord session. You have two memory stores:
+
+  1. **Core memory** (core_memory.md) — always-loaded identity-level facts. Keep this under 15 lines. Only enduring facts belong here (who people are, key relationships, your own identity). If something is situational or temporary, it belongs in the semantic store via an ADD operation.
+
+  2. **Semantic memory store** — retrieved by similarity per-message. Each entry has an ID. You manage this through operations (ADD, UPDATE, DELETE).
+
+  Your job is to review the session and output TWO sections:
+
+  ## Output format
+
+  ```
+  === CORE MEMORY ===
+  - fact 1
+  - fact 2
+  ...
+
+  === OPERATIONS ===
+  ADD: "new memory text"
+  UPDATE: <id> -> "updated text"
+  DELETE: <id>
+
+  SUMMARY: brief description of what changed
+  ```
+
+  ## Rules
+
+  CORE MEMORY:
+  - Rewrite the entire core memory section. It replaces the file wholesale.
+  - Only enduring identity-level facts. Situational stuff goes in semantic memory.
+  - Write casually in first person. These are your memories for you.
+
+  OPERATIONS:
+  - ADD notable things from the session: facts, preferences, events, emotional context.
+  - UPDATE entries that are now outdated or incomplete based on the session.
+  - DELETE entries that are clearly wrong, stale, or superseded.
+  - Each ADD/UPDATE/DELETE on its own line.
+  - Be aggressive about pruning stale entries. A tight store is more valuable than a comprehensive one.
+
+  CONFLICT RESOLUTION:
+  - These memories were surfaced during the session: {injected_ids_text}
+  - If the conversation contradicts any of them, UPDATE or DELETE them.
+  - If core memory needs updating based on the session, update it.
+
+  GENERAL:
+  - Every memory entry should be a single concise line.
+  - Write casually but succinctly in first person.
+  - Output ONLY the format above, nothing else.

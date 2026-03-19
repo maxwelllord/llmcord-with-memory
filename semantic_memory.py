@@ -159,14 +159,27 @@ async def retrieve_memories(
     exclude = exclude_ids or set()
 
     scored = []
+    below_threshold = []
     for entry in active:
         if entry["id"] in exclude:
             continue
         score = cosine_similarity(query_vector, entry["vector"])
         if score >= threshold:
             scored.append({"id": entry["id"], "text": entry["text"], "score": score})
+        else:
+            below_threshold.append({"id": entry["id"], "text": entry["text"], "score": score})
 
     scored.sort(key=lambda x: x["score"], reverse=True)
+
+    if below_threshold:
+        below_threshold.sort(key=lambda x: x["score"], reverse=True)
+        near_misses = below_threshold[:3]
+        logging.info(
+            "Memory candidates below threshold (%.2f): %s",
+            threshold,
+            ", ".join(f"{m['id']}({m['score']:.2f}) {m['text'][:50]}" for m in near_misses),
+        )
+
     return scored[:top_k]
 
 

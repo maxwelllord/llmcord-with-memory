@@ -5,6 +5,7 @@ import logging
 from pathlib import Path
 
 import discord
+import yaml
 from openai import AsyncOpenAI
 
 from semantic_memory import (
@@ -12,6 +13,7 @@ from semantic_memory import (
     get_active_memories,
     execute_sweep_operations,
 )
+from turn_logger import log_sweep_turn
 
 SESSION_GAP_SECONDS = 2 * 60 * 60  # 2 hours
 MAX_MESSAGES_SANITY = 500
@@ -70,54 +72,13 @@ memory_store = MemoryStore(
 # Sweep prompt
 # ---------------------------------------------------------------------------
 
-SWEEP_PROMPT = """\
-You are Claude. You are performing a memory review after a Discord session. You have two memory stores:
-
-1. **Core memory** (core_memory.md) — always-loaded identity-level facts. Keep this under 15 lines. Only enduring facts belong here (who people are, key relationships, your own identity). If something is situational or temporary, it belongs in the semantic store via an ADD operation.
-
-2. **Semantic memory store** — retrieved by similarity per-message. Each entry has an ID. You manage this through operations (ADD, UPDATE, DELETE).
-
-Your job is to review the session and output TWO sections:
-
-## Output format
-
-```
-=== CORE MEMORY ===
-- fact 1
-- fact 2
-...
-
-=== OPERATIONS ===
-ADD: "new memory text"
-UPDATE: <id> -> "updated text"
-DELETE: <id>
-
-SUMMARY: brief description of what changed
-```
-
-## Rules
-
-CORE MEMORY:
-- Rewrite the entire core memory section. It replaces the file wholesale.
-- Only enduring identity-level facts. Situational stuff goes in semantic memory.
-- Write casually in first person. These are your memories for you.
-
-OPERATIONS:
-- ADD notable things from the session: facts, preferences, events, emotional context.
-- UPDATE entries that are now outdated or incomplete based on the session.
-- DELETE entries that are clearly wrong, stale, or superseded.
-- Each ADD/UPDATE/DELETE on its own line.
-- Be aggressive about pruning stale entries. A tight store is more valuable than a comprehensive one.
-
-CONFLICT RESOLUTION:
-- These memories were surfaced during the session: {injected_ids_text}
-- If the conversation contradicts any of them, UPDATE or DELETE them.
-- If core memory needs updating based on the session, update it.
-
-GENERAL:
-- Every memory entry should be a single concise line.
-- Write casually but succinctly in first person.
-- Output ONLY the format above, nothing else.
+def _load_sweep_prompt() -> str:
+    """Load the sweep prompt from config.yaml and append template placeholders."""
+    config_path = Path(__file__).parent / "config.yaml"
+    with open(config_path, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+    base_prompt = cfg.get("sweep_prompt", "").rstrip()
+    return base_prompt + """
 
 <current_core_memory>
 {core_memory}
@@ -130,6 +91,9 @@ GENERAL:
 <previous_session_messages>
 {messages}
 </previous_session_messages>"""
+
+
+SWEEP_PROMPT = _load_sweep_prompt()
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +228,11 @@ async def run_memory_sweep(
             extra_body=api_kwargs.get("extra_body"),
         )
         output = resp.choices[0].message.content.strip()
+
+        try:
+            log_sweep_turn(model=model, prompt=prompt, output=output)
+        except Exception:
+            logging.exception("Failed to write sweep log")
 
         # Use the embedding client for operations (ADD/UPDATE need embeddings)
         emb_client = embedding_client or openai_client
