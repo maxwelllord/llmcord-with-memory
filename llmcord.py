@@ -37,8 +37,7 @@ EMBED_COLOR_INCOMPLETE = discord.Color.orange()
 STREAMING_INDICATOR = " ⚪"
 EDIT_DELAY_SECONDS = 1
 
-MAX_MESSAGE_NODES = 500
-MAX_MESSAGES_SANITY = 500
+MAX_MESSAGES = 500
 
 SUPPORTED_IMAGE_TYPES = ("image/jpeg", "image/png")
 
@@ -173,7 +172,7 @@ class MCPClient:
                 return "\n".join(parts)
             return "Tool executed successfully (no output)"
         except Exception as e:
-            logging.exception(f"Error calling MCP tool {name}")
+            logging.exception("Error calling MCP tool %s", name)
             return f"Error calling tool: {str(e)}"
 
     def is_ready(self) -> bool:
@@ -425,7 +424,7 @@ async def build_chain_thread(
     except (discord.NotFound, discord.HTTPException):
         logging.exception("Error fetching thread starter message")
 
-    async for msg in new_msg.channel.history(limit=MAX_MESSAGES_SANITY, oldest_first=True):
+    async for msg in new_msg.channel.history(limit=MAX_MESSAGES, oldest_first=True):
         if msg.type in (discord.MessageType.default, discord.MessageType.reply):
             thread_msgs.append(msg)
 
@@ -469,7 +468,7 @@ async def build_chain_dm(
     curr_msg = new_msg
     estimated_tokens = 0
 
-    while curr_msg is not None and len(messages) < MAX_MESSAGES_SANITY:
+    while curr_msg is not None and len(messages) < MAX_MESSAGES:
         node = msg_nodes.setdefault(curr_msg.id, MsgNode())
 
         async with node.lock:
@@ -513,7 +512,7 @@ async def build_chain_channel(
     estimated_tokens = 0
     prev_msg_time = new_msg.created_at
 
-    async for msg in new_msg.channel.history(limit=MAX_MESSAGES_SANITY, before=new_msg):
+    async for msg in new_msg.channel.history(limit=MAX_MESSAGES, before=new_msg):
         if msg.type not in (discord.MessageType.default, discord.MessageType.reply):
             continue
 
@@ -555,6 +554,46 @@ async def build_chain_channel(
 # ---------------------------------------------------------------------------
 # System prompt construction
 # ---------------------------------------------------------------------------
+
+def create_provider_client(cfg: dict, provider_slash_model: str) -> tuple[AsyncOpenAI, str, dict]:
+    """Create an OpenAI client from a provider/model string. Returns (client, model, api_kwargs)."""
+    provider, model = provider_slash_model.removesuffix(":vision").split("/", 1)
+    provider_config = cfg["providers"][provider]
+
+    client = AsyncOpenAI(
+        base_url=provider_config["base_url"],
+        api_key=provider_config.get("api_key", "sk-no-key-required"),
+    )
+
+    model_parameters = cfg["models"].get(provider_slash_model) or {}
+    extra_headers = provider_config.get("extra_headers")
+    extra_query = provider_config.get("extra_query")
+    extra_body = (provider_config.get("extra_body") or {}) | model_parameters or None
+
+    return client, model, dict(
+        provider=provider,
+        provider_config=provider_config,
+        model_parameters=model_parameters,
+        extra_headers=extra_headers,
+        extra_query=extra_query,
+        extra_body=extra_body,
+    )
+
+
+def create_embedding_client(cfg: dict) -> tuple[AsyncOpenAI | None, str | None]:
+    """Create an embedding client from config. Returns (client, model) or (None, None)."""
+    embedding_model_full = cfg.get("embedding_model")
+    if not embedding_model_full:
+        return None, None
+
+    emb_provider, emb_model = embedding_model_full.split("/", 1)
+    emb_provider_config = cfg["providers"][emb_provider]
+    emb_client = AsyncOpenAI(
+        base_url=emb_provider_config["base_url"],
+        api_key=emb_provider_config.get("api_key", "sk-no-key-required"),
+    )
+    return emb_client, emb_model
+
 
 def build_system_prompt(cfg: dict) -> str | None:
     """Build the system prompt with date/time and memory injected."""
@@ -729,9 +768,9 @@ async def cache_image_descriptions(
 # ---------------------------------------------------------------------------
 
 async def cleanup_old_nodes() -> None:
-    """Evict the oldest MsgNodes if the cache exceeds MAX_MESSAGE_NODES."""
-    if (num_nodes := len(msg_nodes)) > MAX_MESSAGE_NODES:
-        for msg_id in sorted(msg_nodes.keys())[: num_nodes - MAX_MESSAGE_NODES]:
+    """Evict the oldest MsgNodes if the cache exceeds MAX_MESSAGES."""
+    if (num_nodes := len(msg_nodes)) > MAX_MESSAGES:
+        for msg_id in sorted(msg_nodes.keys())[: num_nodes - MAX_MESSAGES]:
             async with msg_nodes.setdefault(msg_id, MsgNode()).lock:
                 msg_nodes.pop(msg_id, None)
 
@@ -752,7 +791,7 @@ async def info_command(interaction: discord.Interaction) -> None:
     prev_msg_time = datetime.now(timezone.utc)
     earliest_time = prev_msg_time
 
-    async for msg in channel.history(limit=MAX_MESSAGES_SANITY):
+    async for msg in channel.history(limit=MAX_MESSAGES):
         if msg.type not in (discord.MessageType.default, discord.MessageType.reply):
             continue
 
@@ -822,30 +861,14 @@ async def sweep_command(interaction: discord.Interaction) -> None:
 
     await interaction.response.send_message("🧠 Manual sweep starting...", ephemeral=True)
 
-    # Set up LLM client (same as on_message)
-    provider_slash_model = curr_model
-    provider, model = provider_slash_model.removesuffix(":vision").split("/", 1)
-    provider_config = cfg["providers"][provider]
-    openai_client = AsyncOpenAI(
-        base_url=provider_config["base_url"],
-        api_key=provider_config.get("api_key", "sk-no-key-required"),
-    )
-    extra_headers = provider_config.get("extra_headers")
-    extra_query = provider_config.get("extra_query")
-    model_parameters = cfg["models"].get(provider_slash_model, None)
-    extra_body = (provider_config.get("extra_body") or {}) | (model_parameters or {}) or None
+    # Set up LLM client
+    openai_client, model, api_kwargs = create_provider_client(cfg, curr_model)
+    extra_headers = api_kwargs["extra_headers"]
+    extra_query = api_kwargs["extra_query"]
+    extra_body = api_kwargs["extra_body"]
 
     # Set up embedding client
-    embedding_model_full = cfg.get("embedding_model")
-    emb_client = None
-    emb_model = None
-    if embedding_model_full:
-        emb_provider, emb_model = embedding_model_full.split("/", 1)
-        emb_provider_config = cfg["providers"][emb_provider]
-        emb_client = AsyncOpenAI(
-            base_url=emb_provider_config["base_url"],
-            api_key=emb_provider_config.get("api_key", "sk-no-key-required"),
-        )
+    emb_client, emb_model = create_embedding_client(cfg)
 
     # Collect and sweep
     session_msgs = await collect_since_last_sweep(interaction.channel, discord_bot.user)
@@ -885,7 +908,7 @@ async def on_ready() -> None:
         if mcp_client.is_ready():
             logging.info("MCP client ready!")
         else:
-            logging.warning(f"MCP client failed to initialize: {mcp_client._error}")
+            logging.warning("MCP client failed to initialize: %s", mcp_client._error)
     else:
         logging.info("MCP disabled in config")
 
@@ -913,18 +936,13 @@ async def on_message(new_msg: discord.Message) -> None:
     async with lock:
         # --- Provider / model setup ---
         provider_slash_model = curr_model
-        provider, model = provider_slash_model.removesuffix(":vision").split("/", 1)
-        provider_config = cfg["providers"][provider]
-
-        openai_client = AsyncOpenAI(
-            base_url=provider_config["base_url"],
-            api_key=provider_config.get("api_key", "sk-no-key-required"),
-        )
-
-        model_parameters = cfg["models"].get(provider_slash_model, None)
-        extra_headers = provider_config.get("extra_headers")
-        extra_query = provider_config.get("extra_query")
-        extra_body = (provider_config.get("extra_body") or {}) | (model_parameters or {}) or None
+        openai_client, model, api_kwargs = create_provider_client(cfg, provider_slash_model)
+        provider = api_kwargs["provider"]
+        provider_config = api_kwargs["provider_config"]
+        model_parameters = api_kwargs["model_parameters"]
+        extra_headers = api_kwargs["extra_headers"]
+        extra_query = api_kwargs["extra_query"]
+        extra_body = api_kwargs["extra_body"]
 
         accept_images = any(x in provider_slash_model.lower() for x in VISION_MODEL_TAGS)
         max_text = cfg.get("max_text", 100000)
@@ -950,16 +968,7 @@ async def on_message(new_msg: discord.Message) -> None:
         logging.info(f"Message received (user ID: {new_msg.author.id}, attachments: {len(new_msg.attachments)}, conversation length: {len(messages)}):\n{new_msg.content}")
 
         # --- Embedding client setup ---
-        embedding_model_full = cfg.get("embedding_model")
-        emb_client = None
-        emb_model = None
-        if embedding_model_full:
-            emb_provider, emb_model = embedding_model_full.split("/", 1)
-            emb_provider_config = cfg["providers"][emb_provider]
-            emb_client = AsyncOpenAI(
-                base_url=emb_provider_config["base_url"],
-                api_key=emb_provider_config.get("api_key", "sk-no-key-required"),
-            )
+        emb_client, emb_model = create_embedding_client(cfg)
 
         # --- Memory sweep ---
         channel_injected = session_injected_ids.get(new_msg.channel.id, set())
