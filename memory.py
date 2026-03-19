@@ -136,10 +136,7 @@ async def collect_previous_session(
                 continue
 
         if found_session_start:
-            # We're now in the previous session — collect until another gap
-            if session_msgs and gap >= SESSION_GAP_SECONDS:
-                break
-
+            # Collect all messages back to last sweep — don't stop at intermediate gaps
             author = "Assistant" if msg.author == bot_user else msg.author.display_name
             session_msgs.append(dict(author=author, content=msg.content))
 
