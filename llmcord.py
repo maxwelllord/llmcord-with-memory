@@ -193,7 +193,6 @@ class MsgNode:
     image_descriptions: list[str] = field(default_factory=list)
 
     has_bad_attachments: bool = False
-    fetch_parent_failed: bool = False
 
     parent_msg: Optional[discord.Message] = None
 
@@ -277,35 +276,6 @@ def build_message_content(
         return dict(content=content, role=node.role), warnings
     return None, warnings
 
-
-# ---------------------------------------------------------------------------
-# Helper: resolve parent message for DM reply-chain walking
-# ---------------------------------------------------------------------------
-
-async def resolve_parent_msg(node: MsgNode, msg: discord.Message) -> None:
-    """Populate node.parent_msg by checking reply references and channel history."""
-    try:
-        if (
-            msg.reference is None
-            and discord_bot.user.mention not in msg.content
-            and (prev_msg_in_channel := ([m async for m in msg.channel.history(before=msg, limit=1)] or [None])[0])
-            and prev_msg_in_channel.type in (discord.MessageType.default, discord.MessageType.reply)
-            and prev_msg_in_channel.author == (discord_bot.user if msg.channel.type == discord.ChannelType.private else msg.author)
-        ):
-            node.parent_msg = prev_msg_in_channel
-        else:
-            is_public_thread = msg.channel.type == discord.ChannelType.public_thread
-            parent_is_thread_start = is_public_thread and msg.reference is None and msg.channel.parent.type == discord.ChannelType.text
-
-            if parent_msg_id := msg.channel.id if parent_is_thread_start else getattr(msg.reference, "message_id", None):
-                if parent_is_thread_start:
-                    node.parent_msg = msg.channel.starter_message or await msg.channel.parent.fetch_message(parent_msg_id)
-                else:
-                    node.parent_msg = msg.reference.cached_message or await msg.channel.fetch_message(parent_msg_id)
-
-    except (discord.NotFound, discord.HTTPException):
-        logging.exception("Error fetching next message in the chain")
-        node.fetch_parent_failed = True
 
 
 # ---------------------------------------------------------------------------
@@ -406,104 +376,21 @@ async def check_interjection(new_msg: discord.Message, cfg: dict) -> bool:
 # Message chain builders
 # ---------------------------------------------------------------------------
 
-async def build_chain_thread(
-    new_msg: discord.Message,
-    max_text: int,
-    max_images: int,
-    max_context_tokens: int,
-    nodes_needing_descriptions: list[MsgNode],
-) -> tuple[list[dict], set[str], datetime]:
-    """Build the message chain from a thread's history, limited by token budget."""
-    warnings: set[str] = set()
-    thread_msgs: list[discord.Message] = []
-
-    try:
-        if new_msg.channel.type == discord.ChannelType.public_thread and new_msg.channel.parent.type == discord.ChannelType.text:
-            starter = new_msg.channel.starter_message or await new_msg.channel.parent.fetch_message(new_msg.channel.id)
-            if starter:
-                thread_msgs.append(starter)
-    except (discord.NotFound, discord.HTTPException):
-        logging.exception("Error fetching thread starter message")
-
-    async for msg in new_msg.channel.history(limit=MAX_MESSAGES, oldest_first=True):
-        if msg.type in (discord.MessageType.default, discord.MessageType.reply):
-            thread_msgs.append(msg)
-
-    # Build all message dicts
-    all_built: list[tuple[dict, discord.Message]] = []
-    for msg in thread_msgs:
-        node = msg_nodes.setdefault(msg.id, MsgNode())
-        async with node.lock:
-            await populate_node(node, msg)
-        result, w = build_message_content(node, max_text, max_images, nodes_needing_descriptions)
-        warnings |= w
-        if result:
-            all_built.append((result, msg))
-
-    # Trim oldest messages to fit token budget
-    total_tokens = sum(message_token_estimate(m) for m, _ in all_built)
-    original_count = len(all_built)
-    while all_built and total_tokens > max_context_tokens:
-        removed, _ = all_built.pop(0)
-        total_tokens -= message_token_estimate(removed)
-
-    if len(all_built) < original_count:
-        warnings.add(f"⚠️ Trimmed to last {len(all_built)} messages (~{total_tokens:,} tokens)")
-
-    messages = [m for m, _ in all_built]
-    earliest = all_built[0][1].created_at if all_built else new_msg.created_at
-    return messages, warnings, earliest
-
-
-async def build_chain_dm(
-    new_msg: discord.Message,
-    max_text: int,
-    max_images: int,
-    max_context_tokens: int,
-    nodes_needing_descriptions: list[MsgNode],
-) -> tuple[list[dict], set[str], datetime]:
-    """Build the message chain by walking the reply chain (DMs), limited by token budget."""
-    messages: list[dict] = []
-    warnings: set[str] = set()
-    earliest = new_msg.created_at
-    curr_msg = new_msg
-    estimated_tokens = 0
-
-    while curr_msg is not None and len(messages) < MAX_MESSAGES:
-        node = msg_nodes.setdefault(curr_msg.id, MsgNode())
-
-        async with node.lock:
-            await populate_node(node, curr_msg)
-            await resolve_parent_msg(node, curr_msg)
-
-        result, w = build_message_content(node, max_text, max_images, nodes_needing_descriptions)
-        warnings |= w
-        if result:
-            msg_tokens = message_token_estimate(result)
-            if messages and estimated_tokens + msg_tokens > max_context_tokens:
-                warnings.add(f"⚠️ Stopped at {len(messages)} messages (~{estimated_tokens:,} tokens)")
-                break
-            estimated_tokens += msg_tokens
-            messages.append(result)
-            earliest = curr_msg.created_at
-
-        if node.fetch_parent_failed:
-            warnings.add(f"⚠️ Only using last {len(messages)} message{'' if len(messages) == 1 else 's'}")
-
-        curr_msg = node.parent_msg
-
-    return messages, warnings, earliest
-
-
-async def build_chain_channel(
+async def _build_chain_common(
     new_msg: discord.Message,
     cfg: dict,
     max_text: int,
     max_images: int,
     max_context_tokens: int,
     nodes_needing_descriptions: list[MsgNode],
-) -> tuple[list[dict], set[str], datetime]:
-    """Build the message chain from recent channel history with gap/token cutoffs."""
+    skip_msg_ids: set[int] | None = None,
+) -> tuple[list[dict], set[str], datetime, list[discord.Message], list[discord.Message]]:
+    """Shared history scan with gap detection and context bridge.
+
+    Returns (messages, warnings, earliest, recent_msgs, bridge_msgs) where
+    messages contains the built bridge separator and message dicts, and
+    recent/bridge lists are exposed for callers that need the raw Discord messages.
+    """
     messages: list[dict] = []
     warnings: set[str] = set()
 
@@ -520,6 +407,8 @@ async def build_chain_channel(
 
     async for msg in new_msg.channel.history(limit=MAX_MESSAGES, before=new_msg):
         if msg.type not in (discord.MessageType.default, discord.MessageType.reply):
+            continue
+        if skip_msg_ids and msg.id in skip_msg_ids:
             continue
 
         if not gap_found:
@@ -582,8 +471,75 @@ async def build_chain_channel(
     if result:
         messages.append(result)
 
-    earliest = recent_msgs[-1].created_at if recent_msgs else new_msg.created_at
+    earliest = bridge_msgs[-1].created_at if bridge_msgs else (recent_msgs[-1].created_at if recent_msgs else new_msg.created_at)
 
+    return messages, warnings, earliest, recent_msgs, bridge_msgs
+
+
+async def build_chain_thread(
+    new_msg: discord.Message,
+    cfg: dict,
+    max_text: int,
+    max_images: int,
+    max_context_tokens: int,
+    nodes_needing_descriptions: list[MsgNode],
+) -> tuple[list[dict], set[str], datetime]:
+    """Build the message chain from a thread's history with gap/token cutoffs."""
+    # Fetch thread starter for public threads (lives in parent channel)
+    starter_msg: discord.Message | None = None
+    try:
+        if new_msg.channel.type == discord.ChannelType.public_thread and new_msg.channel.parent.type == discord.ChannelType.text:
+            starter_msg = new_msg.channel.starter_message or await new_msg.channel.parent.fetch_message(new_msg.channel.id)
+    except (discord.NotFound, discord.HTTPException):
+        logging.exception("Error fetching thread starter message")
+
+    skip_ids = {starter_msg.id} if starter_msg else None
+    messages, warnings, earliest, _, _ = await _build_chain_common(
+        new_msg, cfg, max_text, max_images, max_context_tokens, nodes_needing_descriptions,
+        skip_msg_ids=skip_ids,
+    )
+
+    # Prepend thread starter at the top
+    if starter_msg:
+        node = msg_nodes.setdefault(starter_msg.id, MsgNode())
+        async with node.lock:
+            await populate_node(node, starter_msg)
+        result, w = build_message_content(node, max_text, max_images, nodes_needing_descriptions)
+        warnings |= w
+        if result:
+            messages.insert(0, result)
+        earliest = starter_msg.created_at
+
+    return messages, warnings, earliest
+
+
+async def build_chain_dm(
+    new_msg: discord.Message,
+    cfg: dict,
+    max_text: int,
+    max_images: int,
+    max_context_tokens: int,
+    nodes_needing_descriptions: list[MsgNode],
+) -> tuple[list[dict], set[str], datetime]:
+    """Build the message chain from DM history with gap/token cutoffs."""
+    messages, warnings, earliest, _, _ = await _build_chain_common(
+        new_msg, cfg, max_text, max_images, max_context_tokens, nodes_needing_descriptions,
+    )
+    return messages, warnings, earliest
+
+
+async def build_chain_channel(
+    new_msg: discord.Message,
+    cfg: dict,
+    max_text: int,
+    max_images: int,
+    max_context_tokens: int,
+    nodes_needing_descriptions: list[MsgNode],
+) -> tuple[list[dict], set[str], datetime]:
+    """Build the message chain from recent channel history with gap/token cutoffs."""
+    messages, warnings, earliest, _, _ = await _build_chain_common(
+        new_msg, cfg, max_text, max_images, max_context_tokens, nodes_needing_descriptions,
+    )
     return messages, warnings, earliest
 
 
@@ -1007,11 +963,11 @@ async def on_message(new_msg: discord.Message) -> None:
 
         if is_thread:
             messages, user_warnings, earliest_msg_time = await build_chain_thread(
-                new_msg, max_text, max_images, max_context_tokens, nodes_needing_descriptions,
+                new_msg, cfg, max_text, max_images, max_context_tokens, nodes_needing_descriptions,
             )
         elif is_dm:
             messages, user_warnings, earliest_msg_time = await build_chain_dm(
-                new_msg, max_text, max_images, max_context_tokens, nodes_needing_descriptions,
+                new_msg, cfg, max_text, max_images, max_context_tokens, nodes_needing_descriptions,
             )
         else:
             messages, user_warnings, earliest_msg_time = await build_chain_channel(
@@ -1073,7 +1029,7 @@ async def on_message(new_msg: discord.Message) -> None:
                 logging.exception("Semantic memory retrieval failed")
 
         # --- System prompt & message ordering ---
-        ordered_messages = messages[::-1] if is_dm else messages
+        ordered_messages = messages
         system_prompt = build_system_prompt(cfg)
 
         earliest_timestamp = int(earliest_msg_time.timestamp())
