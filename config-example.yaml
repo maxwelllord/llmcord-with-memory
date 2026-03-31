@@ -115,6 +115,16 @@ models:
 
 interjection_model: openrouter/google/gemma-3-4b-it
 
+interjection_prompt: |
+  You decide whether an AI assistant should interject in a Discord conversation. Be conservative. Only say YES if:
+  - Someone says hi to the assistant (the assistant is called {bot_name})
+  - Someone is asking a question that hasn't been answered
+  - Someone is directly asking for help or information the assistant could provide
+  - The assistant was recently part of the conversation and a follow-up is natural
+
+  Do NOT interject if users are just chatting, joking, or having a normal conversation. When in doubt, say NO.
+  Respond with only YES or NO.
+
 # Embedding model used for semantic memory retrieval.
 # Omit or leave blank to disable semantic memory (only core memory will be used).
 

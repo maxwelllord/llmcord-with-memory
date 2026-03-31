@@ -340,17 +340,11 @@ async def check_interjection(new_msg: discord.Message, cfg: dict) -> bool:
         api_key=ij_provider_config.get("api_key", "sk-no-key-required"),
     )
 
-    gate_system = (
-        "You decide whether an AI assistant should interject in a Discord conversation. "
-        "Be conservative. Only say YES if:\n"
-        "- Someone says hi to the assistant (the assistant is called Claude)"
-        "- Someone is asking a question that hasn't been answered\n"
-        "- Someone is directly asking for help or information the assistant could provide\n"
-        "- The assistant was recently part of the conversation and a follow-up is natural\n\n"
-        "Do NOT interject if users are just chatting, joking, or having a normal conversation. "
-        "When in doubt, say NO.\n"
-        "Respond with only YES or NO."
-    )
+    gate_system = cfg.get("interjection_prompt", "").strip()
+    if not gate_system:
+        logging.warning("No interjection_prompt in config, skipping interjection check.")
+        return False
+    gate_system = gate_system.replace("{bot_name}", discord_bot.user.display_name)
 
     try:
         gate_resp = await ij_client.chat.completions.create(
