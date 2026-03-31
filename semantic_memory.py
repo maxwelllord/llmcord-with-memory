@@ -16,7 +16,7 @@ from pathlib import Path
 from openai import AsyncOpenAI
 
 
-MEMORY_DIR = Path(__file__).parent
+MEMORY_DIR = Path(__file__).parent / "memory"
 CORE_MEMORY_FILE = MEMORY_DIR / "core_memory.md"
 MEMORY_JSON_FILE = MEMORY_DIR / "memory.json"
 

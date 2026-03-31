@@ -54,7 +54,7 @@ class MemoryStore:
 
 
 memory_store = MemoryStore(
-    sweep_state_file=Path(__file__).parent / "sweep_state.json",
+    sweep_state_file=Path(__file__).parent / "memory" / "sweep_state.json",
 )
 
 
