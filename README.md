@@ -1,14 +1,12 @@
-<h1 align="center">
+<h1>
 LLMcord with memory
 </h1>
 
-<h3 align="center">
+<h3>
 A discord bot with a simple but effective memory system.
 </h3>
 
-<p align="center">
-  <img src="https://github.com/user-attachments/assets/7791cc6b-6755-484f-a9e3-0707765b081f" alt="">
-</p>
+![Example user interaction](https://github.com/user-attachments/assets/eb8d1712-6d67-4450-a029-4c6826f450a7)
 
 ## Features
 
@@ -39,6 +37,9 @@ The bot tracks **sessions** based on a configurable inactivity gap (default 2 ho
 You can also trigger a sweep manually at any time with the `/sweep` command.
 
 ### Memory Retrieval
+
+
+![Example retrieval](https://github.com/user-attachments/assets/12ed3f59-770e-4b13-83ca-7312c85b2afb)
 
 When you send a message, the bot embeds your message and compares it against stored semantic memories. The top 3 most relevant results (above a similarity threshold of 0.4) are injected into the conversation so the LLM can use them naturally. Already-recalled memories won't be injected again in the same session.
 
@@ -98,6 +99,10 @@ Add your OpenRouter API key to the config.yaml.
    ```
 
 ### Invite the Bot (First Launch Only)
+
+9. Use the link from the terminal to invite the bot to the desired servers. (Ctrl+Click or copy and paste into your browser)
+
+![Bot link](https://github.com/user-attachments/assets/c56e492b-d0b6-494c-87be-eb63aa314ea6)
 
 ### Discord settings:
 
