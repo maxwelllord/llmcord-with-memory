@@ -2,6 +2,7 @@ import asyncio
 from datetime import datetime, timezone
 import json
 import logging
+import platform
 from pathlib import Path
 
 import discord
@@ -24,21 +25,11 @@ MAX_MESSAGES_SANITY = 500
 # ---------------------------------------------------------------------------
 
 class MemoryStore:
-    """Encapsulates memory storage and sweep state. Swap this class to change backends."""
+    """Tracks per-channel sweep timestamps."""
 
-    def __init__(self, memory_file: Path, sweep_state_file: Path):
-        self._memory_file = memory_file
+    def __init__(self, sweep_state_file: Path):
         self._sweep_state_file = sweep_state_file
         self._sweep_lock = asyncio.Lock()
-
-    def load(self) -> str:
-        try:
-            return self._memory_file.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            return ""
-
-    def save(self, content: str) -> None:
-        self._memory_file.write_text(content, encoding="utf-8")
 
     async def get_last_sweep_time(self, channel_id: int) -> datetime | None:
         async with self._sweep_lock:
@@ -63,7 +54,6 @@ class MemoryStore:
 
 
 memory_store = MemoryStore(
-    memory_file=Path(__file__).parent / "memory.md",
     sweep_state_file=Path(__file__).parent / "sweep_state.json",
 )
 
@@ -75,6 +65,26 @@ memory_store = MemoryStore(
 def _load_sweep_prompt() -> str:
     """Load the sweep prompt from config.yaml and append template placeholders."""
     config_path = Path(__file__).parent / "config.yaml"
+    if not config_path.exists():
+        example_path = config_path.parent / "config-example.yaml"
+        RED = "\033[91m"
+        YELLOW = "\033[93m"
+        CYAN = "\033[96m"
+        BOLD = "\033[1m"
+        RESET = "\033[0m"
+        copy_cmd = "copy config-example.yaml config.yaml" if platform.system() == "Windows" else "cp config-example.yaml config.yaml"
+        print(f"\n{RED}{'=' * 60}")
+        print(f"  {BOLD}ERROR: config.yaml not found!{RESET}{RED}")
+        print(f"{'=' * 60}{RESET}\n")
+        print(f"  {YELLOW}To get started, duplicate the example config and")
+        print(f"  rename it to {BOLD}config.yaml{RESET}{YELLOW}:{RESET}\n")
+        if example_path.exists():
+            print(f"    {CYAN}{copy_cmd}{RESET}\n")
+        else:
+            print(f"    {RED}(config-example.yaml is also missing!){RESET}\n")
+        print(f"  {YELLOW}Then edit config.yaml with your settings.{RESET}")
+        print(f"{RED}{'=' * 60}{RESET}\n")
+        raise SystemExit(1)
     with open(config_path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
     base_prompt = cfg.get("sweep_prompt", "").rstrip()

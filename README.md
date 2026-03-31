@@ -1,67 +1,62 @@
 <h1 align="center">
-The cooler LLMcord
+LLMcord with memory
 </h1>
 
-<h3 align="center"><i>
-  Talk to LLMs with your friends!
-</i></h3>
+<h3 align="center">
+A discord bot with a simple but effective memory system.
+</h3>
 
 <p align="center">
   <img src="https://github.com/user-attachments/assets/7791cc6b-6755-484f-a9e3-0707765b081f" alt="">
 </p>
 
-llmcord transforms Discord into a collaborative LLM frontend. It works with practically any LLM, remote or locally hosted.
-
 ## Features
 
-### Reply-based chat system:
-Just @ the bot to start a conversation and reply to continue. Build conversations with reply chains!
+**Self-interjection** allows LLMs to lean into the conversation more naturally.
 
-You can:
-- Branch conversations endlessly
-- Continue other people's conversations
-- @ the bot while replying to ANY message to include it in the conversation
+**Automatic memory retrieval** injects stored memories into the chat when they're semantically relevant.
 
-Additionally:
-- When DMing the bot, conversations continue automatically (no reply required). To start a fresh conversation, just @ the bot. You can still reply to continue from anywhere.
-- You can branch conversations into [threads](https://support.discord.com/hc/en-us/articles/4403205878423-Threads-FAQ). Just create a thread from any message and @ the bot inside to continue.
-- Back-to-back messages from the same user are automatically chained together. Just reply to the latest one and the bot will see all of them.
+**Sliding chat context:** set a token budget and the context window automatically adjusts.
 
----
+## How the Memory System Works
 
-### Model switching with `/model`:
-![image](https://github.com/user-attachments/assets/568e2f5c-bf32-4b77-ab57-198d9120f3d2)
+The bot has a two-tiered memory system.
 
-llmcord supports remote models from:
-- [OpenAI API](https://platform.openai.com/docs/models)
-- [xAI API](https://docs.x.ai/docs/models)
-- [Google Gemini API](https://ai.google.dev/gemini-api/docs/models)
-- [Mistral API](https://docs.mistral.ai/getting-started/models/models_overview)
-- [Groq API](https://console.groq.com/docs/models)
-- [OpenRouter API](https://openrouter.ai/models)
+### Core Memory vs Semantic Memory
 
-Or run local models with:
-- [Ollama](https://ollama.com)
-- [LM Studio](https://lmstudio.ai)
-- [vLLM](https://github.com/vllm-project/vllm)
+- **Core memory** (`core_memory.md`) This is always loaded. Holds identity-level facts — who the bot is, key relationships, and permanent details.
+- **Semantic memories** (`memory.json`)  These are retrieved dynamically when a message is sent to chat. Individual facts, preferences, events, and context stored with embeddings.
 
-...Or use any other OpenAI compatible API server.
+### Automatic Memory Sweeps
 
----
+The bot tracks **sessions** based on a configurable inactivity gap (default 2 hours). When a new message comes in after 2 hours of silence, the bot automatically runs a **memory sweep** on the previous session:
 
-### And more:
-- Supports image attachments when using a vision model (like gpt-5, grok-4, claude-4, etc.)
-- Supports text file attachments (.txt, .py, .c, etc.)
-- Customizable personality (aka system prompt)
-- Distinguishes users via their Discord IDs
-- Streamed responses (turns green when complete, automatically splits into separate messages when too long)
-- Hot reloading config (you can change settings without restarting the bot)
-- Displays helpful warnings when appropriate (like "⚠️ Only using last 25 messages" when the customizable message limit is exceeded)
-- Caches message data in a size-managed (no memory leaks) and mutex-protected (no race conditions) global dictionary to maximize efficiency and minimize Discord API calls
-- Fully asynchronous
-- 1 Python file, ~300 lines of code
+1. It collects all messages from the previous session.
+2. It sends them to the LLM along with all existing memories.
+3. The LLM decides what to **add**, **update**, or **delete** — keeping the memory store lean and accurate.
+4. Core memory is rewritten to stay under 15 lines, and stale semantic memories are pruned.
 
-## Instructions
+You can also trigger a sweep manually at any time with the `/sweep` command.
+
+### Memory Retrieval
+
+When you send a message, the bot embeds your message and compares it against stored semantic memories. The top 3 most relevant results (above a similarity threshold of 0.4) are injected into the conversation so the LLM can use them naturally. Already-recalled memories won't be injected again in the same session.
+
+When memories are recalled these are displayed in chat, along with their relevance score.
+
+### Setup
+
+Add your OpenRouter API key to the config.yaml.
+
+## Slash Commands
+
+| Command | Description |
+| --- | --- |
+| **/model** | View or switch the current LLM model. Shows the active model and provides autocomplete for all configured models. Switching requires admin permissions. |
+| **/sweep** | Manually trigger a memory sweep on all messages since the last sweep. Useful if you want the bot to process and remember the current conversation without waiting for the automatic 2-hour session gap. Requires admin or sweep permissions. |
+| **/info** | Shows a context estimate for the current channel — how many messages are in the sliding window, approximate token count, and how far back the context reaches. |
+
+## How to use
 
 1. Clone the repo:
    ```bash
@@ -71,12 +66,45 @@ Or run local models with:
 
 2. Create a copy of "config-example.yaml" named "config.yaml" and set it up:
 
+### Discord Bot Configuration
+
+3. Go to the Discord Developer Portal. Create a 'New Application'.
+
+4. Within your new application: Overview -> General Information, Copy your application's 'Application ID' and set it as the 'client id' in config.yaml.
+
+5. Within Overview -> Bot, click 'Reset Token'. Copy the new token and set it as the 'bot_token' in config.yaml.
+
+6. Still within Overview -> Bot. Enable 'Message Content Intent'.
+
+### Model Configuration
+
+7. Copy your API Key from your LLM provider into config.yaml
+
+### Memory and Interjection (OPTIONAL)
+
+8. The default config uses [OpenRouter](https://openrouter.ai/) for interjection and embedding — just paste your OpenRouter API key into the providers section and memory + interjection will work out of the box.
+
+### Run
+
+   **No Docker:**
+   ```bash
+   python -m pip install -U -r requirements.txt
+   python llmcord.py
+   ```
+
+   **With Docker:**
+   ```bash
+   docker compose up
+   ```
+
+### Invite the Bot (First Launch Only)
+
 ### Discord settings:
 
 | Setting | Description |
 | --- | --- |
 | **bot_token** | Create a new Discord bot at [discord.com/developers/applications](https://discord.com/developers/applications) and generate a token under the "Bot" tab. Also enable "MESSAGE CONTENT INTENT". |
-| **client_id** | Found under the "OAuth2" tab of the Discord bot you just made. |
+| **client_id** | This is your Application ID from Overview -> General Information. OR Client ID from Overview -> OAuth2. They're the same ID. |
 | **status_message** | Set a custom message that displays on the bot's Discord profile.<br /><br />**Max 128 characters.** |
 | **max_text** | The maximum amount of text allowed in a single message, including text from file attachments.<br /><br />Default: `100,000` |
 | **max_images** | The maximum number of image attachments allowed in a single message.<br /><br />Default: `5`<br /><br />**Only applicable when using a vision model.** |
@@ -91,33 +119,15 @@ Or run local models with:
 | --- | --- |
 | **providers** | Add the LLM providers you want to use, each with a `base_url` and optional `api_key` entry. Popular providers (`openai`, `openrouter`, `ollama`, etc.) are already included.<br /><br />**Only supports OpenAI compatible APIs.**<br /><br />**Some providers may need `extra_headers` / `extra_query` / `extra_body` entries for extra HTTP data. See the included `azure-openai` provider for an example.** |
 | **models** | Add the models you want to use in `<provider>/<model>: <parameters>` format (examples are included). When you run `/model` these models will show up as autocomplete suggestions.<br /><br />**Refer to each provider's documentation for supported parameters.**<br /><br />**The first model in your `models` list will be the default model at startup.**<br /><br />**Some vision models may need `:vision` added to the end of their name to enable image support.** |
+| **interjection_model** | A small model used to decide if the bot should respond without being @mentioned. Uses `provider/model` format.<br /><br />**Omit or leave blank to only respond when @mentioned (default).** |
+| **embedding_model** | The model used for semantic memory retrieval. Uses `provider/model` format.<br /><br />**Omit or leave blank to disable semantic memory (only core memory will be used).** |
 | **system_prompt** | Write anything you want to customize the bot's behavior!<br /><br />**Leave blank for no system prompt.**<br /><br />**You can use the `{date}` and `{time}` tags in your system prompt to insert the current date and time, based on your host computer's time zone.**<br /><br />**It is recommended to include something like `"User messages are prefixed with their Discord ID as <@ID>. Use this format to mention users."` in your system prompt to help the bot understand the user message format.** |
+| **sweep_prompt** | The prompt sent to the LLM during memory sweeps. Configurable primarily to adjust personality or core memory length.<br /><br />**A sensible default is included — most users won't need to change this.** |
 
-3. Run the bot:
+### Context settings:
 
-   **No Docker:**
-   ```bash
-   python -m pip install -U -r requirements.txt
-   python llmcord.py
-   ```
-
-   **With Docker:**
-   ```bash
-   docker compose up
-   ```
-
-## Notes
-
-- If you're having issues, try my suggestions [here](https://github.com/jakobdylanc/llmcord/issues/19)
-
-- PRs are welcome :)
-
-## Star History
-
-<a href="https://star-history.com/#jakobdylanc/llmcord&Date">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=jakobdylanc/llmcord&type=Date&theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=jakobdylanc/llmcord&type=Date" />
-    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=jakobdylanc/llmcord&type=Date" />
-  </picture>
-</a>
+| Setting | Description |
+| --- | --- |
+| **context_gap_minutes** | Minutes of inactivity before a context gap is inserted. Messages before the gap are loaded as "bridge" context.<br /><br />Default: `120` |
+| **max_context_tokens** | Token budget for recent messages in the sliding context window.<br /><br />Default: `10,000` |
+| **context_bridge_tokens** | Token budget for older messages loaded before a context gap, giving the bot some history from before the silence.<br /><br />Default: `1,000` |

@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import io
 import json
 import logging
+import platform
 from typing import Any, Literal, Optional
 
 from PIL import Image
@@ -21,7 +22,7 @@ from anthropic import AsyncAnthropic
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from memory import memory_store, check_and_run_memory_sweep, collect_since_last_sweep, run_memory_sweep
+from memory import check_and_run_memory_sweep, collect_since_last_sweep, run_memory_sweep
 from semantic_memory import load_core_memory, retrieve_memories
 from turn_logger import log_message_turn
 
@@ -513,7 +514,7 @@ async def build_chain_thread(
     return messages, warnings, earliest
 
 
-async def build_chain_dm(
+async def build_chain_simple(
     new_msg: discord.Message,
     cfg: dict,
     max_text: int,
@@ -521,22 +522,7 @@ async def build_chain_dm(
     max_context_tokens: int,
     nodes_needing_descriptions: list[MsgNode],
 ) -> tuple[list[dict], set[str], datetime]:
-    """Build the message chain from DM history with gap/token cutoffs."""
-    messages, warnings, earliest, _, _ = await _build_chain_common(
-        new_msg, cfg, max_text, max_images, max_context_tokens, nodes_needing_descriptions,
-    )
-    return messages, warnings, earliest
-
-
-async def build_chain_channel(
-    new_msg: discord.Message,
-    cfg: dict,
-    max_text: int,
-    max_images: int,
-    max_context_tokens: int,
-    nodes_needing_descriptions: list[MsgNode],
-) -> tuple[list[dict], set[str], datetime]:
-    """Build the message chain from recent channel history with gap/token cutoffs."""
+    """Build the message chain from DM or channel history with gap/token cutoffs."""
     messages, warnings, earliest, _, _ = await _build_chain_common(
         new_msg, cfg, max_text, max_images, max_context_tokens, nodes_needing_descriptions,
     )
@@ -895,10 +881,58 @@ async def sweep_command(interaction: discord.Interaction) -> None:
     session_injected_ids.pop(interaction.channel.id, None)
 
 
+def _check_provider_api_keys(cfg: dict) -> None:
+    """Warn on startup if any actively-used remote provider is missing an API key."""
+    models_to_check: list[tuple[str, str]] = []  # (label, provider/model)
+
+    models_to_check.append(("model", curr_model))
+    if ij := cfg.get("interjection_model"):
+        models_to_check.append(("interjection_model", ij))
+    if emb := cfg.get("embedding_model"):
+        models_to_check.append(("embedding_model", emb))
+
+    for label, provider_slash_model in models_to_check:
+        provider = provider_slash_model.removesuffix(":vision").split("/", 0 + 1)[0]
+        provider_config = cfg.get("providers", {}).get(provider)
+        if provider_config is None:
+            logging.warning(f"Config '{label}' references unknown provider '{provider}'")
+            continue
+        base_url = provider_config.get("base_url", "")
+        is_local = "localhost" in base_url or "127.0.0.1" in base_url
+        has_key = bool(provider_config.get("api_key"))
+        if not is_local and not has_key:
+            YELLOW = "\033[93m"
+            CYAN = "\033[96m"
+            BOLD = "\033[1m"
+            RESET = "\033[0m"
+            feature_hint = ""
+            if label == "interjection_model":
+                feature_hint = f"\n  {YELLOW}Interjections (spontaneous replies) will {BOLD}not work{RESET}{YELLOW} without this key.{RESET}"
+            elif label == "embedding_model":
+                feature_hint = f"\n  {YELLOW}Memory (semantic recall & sweep) will {BOLD}not work{RESET}{YELLOW} without this key.{RESET}"
+            print(f"\n{YELLOW}{'=' * 60}")
+            print(f"  {BOLD}WARNING: '{label}' provider '{provider}' has no api_key{RESET}{YELLOW}")
+            print(f"{'=' * 60}{RESET}")
+            print(f"\n  {YELLOW}Set the API key in {CYAN}config.yaml{RESET}{YELLOW} under:{RESET}")
+            print(f"  {CYAN}providers → {provider} → api_key{RESET}{feature_hint}")
+            print(f"\n{YELLOW}{'=' * 60}{RESET}\n")
+
+
 @discord_bot.event
 async def on_ready() -> None:
     if client_id := config.get("client_id"):
-        logging.info(f"\n\nBOT INVITE URL:\nhttps://discord.com/oauth2/authorize?client_id={client_id}&permissions=412317191168&scope=bot\n")
+        invite_url = f"https://discord.com/oauth2/authorize?client_id={client_id}&permissions=412317191168&scope=bot"
+        GREEN = "\033[92m"
+        CYAN = "\033[96m"
+        BOLD = "\033[1m"
+        RESET = "\033[0m"
+        print(f"\n{GREEN}{'=' * 60}")
+        print(f"  {BOLD}BOT INVITE URL{RESET}{GREEN}")
+        print(f"{'=' * 60}{RESET}")
+        print(f"\n  {CYAN}{BOLD}{invite_url}{RESET}\n")
+        print(f"{GREEN}{'=' * 60}{RESET}\n")
+
+    _check_provider_api_keys(config)
 
     await discord_bot.tree.sync()
 
@@ -965,12 +999,8 @@ async def on_message(new_msg: discord.Message) -> None:
             messages, user_warnings, earliest_msg_time = await build_chain_thread(
                 new_msg, cfg, max_text, max_images, max_context_tokens, nodes_needing_descriptions,
             )
-        elif is_dm:
-            messages, user_warnings, earliest_msg_time = await build_chain_dm(
-                new_msg, cfg, max_text, max_images, max_context_tokens, nodes_needing_descriptions,
-            )
         else:
-            messages, user_warnings, earliest_msg_time = await build_chain_channel(
+            messages, user_warnings, earliest_msg_time = await build_chain_simple(
                 new_msg, cfg, max_text, max_images, max_context_tokens, nodes_needing_descriptions,
             )
 
@@ -1356,11 +1386,51 @@ async def stream_response_anthropic(
     return response_msgs, full_text
 
 
+def _missing_config_error(field: str, hint: str) -> None:
+    """Print a coloured, user-friendly error and exit."""
+    RED = "\033[91m"
+    YELLOW = "\033[93m"
+    CYAN = "\033[96m"
+    BOLD = "\033[1m"
+    RESET = "\033[0m"
+    copy_cmd = "copy config-example.yaml config.yaml" if platform.system() == "Windows" else "cp config-example.yaml config.yaml"
+    print(f"\n{RED}{'=' * 60}")
+    print(f"  {BOLD}ERROR: '{field}' is not set in config.yaml!{RESET}{RED}")
+    print(f"{'=' * 60}{RESET}\n")
+    print(f"  {YELLOW}{hint}{RESET}\n")
+    print(f"  {YELLOW}If you haven't already, duplicate the example config:{RESET}\n")
+    print(f"    {CYAN}{copy_cmd}{RESET}\n")
+    print(f"  {YELLOW}Then fill in the required values in {BOLD}config.yaml{RESET}{YELLOW}.{RESET}")
+    print(f"{RED}{'=' * 60}{RESET}\n")
+    raise SystemExit(1)
+
+
 async def main() -> None:
+    if not config.get("bot_token"):
+        _missing_config_error("bot_token", "A Discord bot token is required. You can find it in the Bot tab\n  of the Discord Developer Portal (https://discord.com/developers).")
+    if not config.get("client_id"):
+        _missing_config_error("client_id", "A Discord application ID is required. You can find it under\n  General Information in the Discord Developer Portal\n  (https://discord.com/developers).")
     await discord_bot.start(config["bot_token"])
 
 
 try:
     asyncio.run(main())
+except discord.errors.PrivilegedIntentsRequired:
+    RED = "\033[91m"
+    YELLOW = "\033[93m"
+    CYAN = "\033[96m"
+    BOLD = "\033[1m"
+    RESET = "\033[0m"
+    print(f"\n{RED}{'=' * 60}")
+    print(f"  {BOLD}ERROR: Privileged intents are not enabled!{RESET}{RED}")
+    print(f"{'=' * 60}{RESET}\n")
+    print(f"  {YELLOW}This bot requires the {BOLD}Message Content{RESET}{YELLOW} intent to be")
+    print(f"  enabled in the Discord Developer Portal:{RESET}\n")
+    print(f"  {CYAN}1.{RESET} {YELLOW}Go to {CYAN}https://discord.com/developers/applications/{RESET}")
+    print(f"  {CYAN}2.{RESET} {YELLOW}Select your application{RESET}")
+    print(f"  {CYAN}3.{RESET} {YELLOW}Navigate to the {BOLD}Bot{RESET}{YELLOW} tab{RESET}")
+    print(f"  {CYAN}4.{RESET} {YELLOW}Under {BOLD}Privileged Gateway Intents{RESET}{YELLOW}, enable:")
+    print(f"     {BOLD}{CYAN}Message Content Intent{RESET}\n")
+    print(f"{RED}{'=' * 60}{RESET}\n")
 except KeyboardInterrupt:
     pass

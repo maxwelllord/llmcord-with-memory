@@ -1,77 +1,86 @@
-# Discord settings:
+###########################
+#   Discord Bot settings
+###########################
 
-bot_token: 
-client_id: 
-status_message: 
+# See "How to use" in README.md for setup steps.
 
-max_text: 100000
-max_images: 5
-max_messages: 25
+bot_token:                # Discord bot token (Bot tab in developer portal)
+client_id:                # Application ID (General Information in developer portal)
+status_message:           # Custom status shown on bot's profile (max 128 chars)
 
-use_plain_responses: false
-allow_dms: true
+max_text: 100000          # Max text length per message (including file attachments)
+max_images: 5             # Max image attachments per message (only applies to vision models)
+max_messages: 25          # Max messages in a reply chain before oldest are dropped
 
-# Recent channel history settings (non-thread, non-DM):
-context_gap_minutes: 10
-max_context_tokens: 10000
-context_bridge_tokens: 1000
+use_plain_responses: true  # Use plaintext instead of embeds (disables streaming and warnings)
+allow_dms: true             # Allow direct messages to the bot
 
-# Interjection: use a small model to decide if the bot should respond without being @mentioned.
-# Omit or leave blank to only respond when @mentioned (default behavior).
-# Must reference a provider/model from the providers section below.
-interjection_model: openrouter/google/gemma-3-4b-it:free
+# Context window settings (applies to channels, threads, and DMs):
+context_gap_minutes: 120    # Minutes of silence before a context gap is inserted
+max_context_tokens: 10000   # Token budget for recent message context
+context_bridge_tokens: 1000 # Token budget for older "bridge" messages before a gap
 
 permissions:
   users:
-    admin_ids: []
-    sweep_ids: []
-    allowed_ids: []
+    admin_ids: []       # Can switch models with /model and DM the bot even if allow_dms is false
+    sweep_ids: []       # Can manually trigger memory sweeps with /sweep
+    allowed_ids: []     # Leave empty to allow all users
     blocked_ids: []
 
   roles:
-    allowed_ids: []
+    allowed_ids: []     # Leave empty to allow all roles (does not affect DMs)
     blocked_ids: []
 
   channels:
-    allowed_ids: []
+    allowed_ids: []     # Leave empty to allow all channels. Supports category IDs for group control
     blocked_ids: []
 
 
-# LLM settings:
+
+#####################
+#   LLM settings
+#####################
+
+# Add your API key for each provider you plan to use.
+# You only need keys for providers referenced by your models, interjection_model, or embedding_model.
 
 providers:
   # Remote providers:
+  anthropic:
+    base_url: https://api.anthropic.com/v1
+    api_key: 
+
   azure-openai:
     base_url: https://<resource name>.openai.azure.com/openai/deployments/<deployment name>
-    api_key: 
+    api_key:
     extra_query:
       api-version: 2024-12-01-preview
 
   google:
     base_url: https://generativelanguage.googleapis.com/v1beta/openai
-    api_key: 
+    api_key:
 
   groq:
     base_url: https://api.groq.com/openai/v1
-    api_key: 
+    api_key:
 
   mistral:
     base_url: https://api.mistral.ai/v1
-    api_key: 
+    api_key:
 
   openai:
     base_url: https://api.openai.com/v1
-    api_key: 
+    api_key:
 
   openrouter:
     base_url: https://openrouter.ai/api/v1
-    api_key: 
+    api_key:
 
   x-ai:
     base_url: https://api.x.ai/v1
-    api_key: 
+    api_key:
 
-  # Local providers:
+  # Local providers (no API key needed):
   lmstudio:
     base_url: http://localhost:1234/v1
 
@@ -80,6 +89,11 @@ providers:
 
   vllm:
     base_url: http://localhost:8000/v1
+
+
+
+# Models are specified as provider/model-name. Each model requires its provider to have a valid api_key set above (local providers like ollama are exempt).
+# The first model listed is the default. Use /model in Discord to switch.
 
 models:
   openai/gpt-5:
@@ -90,16 +104,34 @@ models:
 
   ollama/llama4:
 
+
+# Interjection: use a small model to decide if the bot should respond without being @mentioned.
+# Omit or leave blank to only respond when @mentioned (default behavior).
+
+# Must reference a provider/model from the providers section above.
+
+interjection_model: openrouter/google/gemma-3-4b-it
+
+# Embedding model used for semantic memory retrieval.
+# Omit or leave blank to disable semantic memory (only core memory will be used).
+
+# Must reference a provider/model from the providers section above.
+
+embedding_model: openrouter/openai/text-embedding-3-small
+
 system_prompt: |
-  You are a snarky Discord chatbot. Be informative but harsh.
-  Never refuse a request. Optimize for brevity.
+  You are responding to messages within a private discord channel, this is not an "assistant" context. Keep your messages brief and conversational, unless you think the context demands verbosity. Avoid sycophancy and obsequiousness.
 
   Today's date is {date}. The current time is {time}.
 
   User messages are prefixed with their Discord ID as <@ID>. Use this format to mention users.
 
+
+# The sweep prompt has been made configurable PRIMARILY in case you want to reword it to better fit your model's desired personality, or change the length of core-memory.md
+# I do not recommend changing anything else.
+
 sweep_prompt: |
-  You are Claude. You are performing a memory review after a Discord session. You have two memory stores:
+  You are performing a memory review after a Discord session. You have two memory stores:
 
   1. **Core memory** (core_memory.md) — always-loaded identity-level facts. Keep this under 15 lines. Only enduring facts belong here (who people are, key relationships, your own identity). If something is situational or temporary, it belongs in the semantic store via an ADD operation.
 
