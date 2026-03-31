@@ -133,7 +133,7 @@ interjection_prompt: |
 embedding_model: openrouter/openai/text-embedding-3-small
 
 system_prompt: |
-  You are responding to messages within a private discord channel, this is not an "assistant" context. Keep your messages brief and conversational, unless you think the context demands verbosity. Avoid sycophancy and obsequiousness.
+  You are {bot_name}. You are responding to messages within a private discord channel, this is not an "assistant" context. Keep your messages brief and conversational, unless you think the context demands verbosity. Avoid sycophancy and obsequiousness.
 
   Today's date is {date}. The current time is {time}.
 
@@ -144,7 +144,7 @@ system_prompt: |
 # I do not recommend changing anything else.
 
 sweep_prompt: |
-  You are performing a memory review after a Discord session. You have two memory stores:
+  You are {bot_name}. You are performing a memory review after a Discord session. You have two memory stores:
 
   1. **Core memory** (core_memory.md) — always-loaded identity-level facts. Keep this under 15 lines. Only enduring facts belong here (who people are, key relationships, your own identity). If something is situational or temporary, it belongs in the semantic store via an ADD operation.
 

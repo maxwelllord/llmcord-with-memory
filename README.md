@@ -76,13 +76,14 @@ See below.
 
 ### Discord Bot Configuration
 
-3. Go to the Discord Developer Portal. Create a 'New Application'.
+3. Go to the [Discord Developer Portal](https://discord.com/developers/applications). Create a 'New Application'. The name of the application does not matter.
 
 4. Within your new application: Overview -> General Information, Copy your application's 'Application ID' and set it as the 'client id' in config.yaml.
 
-5. Within Overview -> Bot, click 'Reset Token'. Copy the new token and set it as the 'bot_token' in config.yaml.
-
-6. Still within Overview -> Bot. Enable 'Message Content Intent'.
+5. Now within Overview -> Bot:
+   - Click 'Reset Token'. Copy the new token and set it as the 'bot_token' in config.yaml.
+   - Change the Bot's display name to whatever you would like to call the bot. This gets used as {bot_name} in prompts in config.yaml.
+   - Enable 'Message Content Intent'.
 
 ### Model Configuration
 
