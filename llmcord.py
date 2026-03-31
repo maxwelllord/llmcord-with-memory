@@ -15,6 +15,7 @@ from discord.app_commands import Choice
 from discord.ext import commands
 from discord.ui import LayoutView, TextDisplay
 import httpx
+import openai
 from openai import AsyncOpenAI
 import yaml
 
@@ -362,6 +363,9 @@ async def check_interjection(new_msg: discord.Message, cfg: dict) -> bool:
         if should_interject:
             logging.info(f"Interjection approved for message {new_msg.id}")
         return should_interject
+    except openai.RateLimitError as e:
+        logging.warning("Interjection gate rate-limited: %s", e)
+        return False
     except Exception:
         logging.exception("Interjection gate check failed")
         return False
