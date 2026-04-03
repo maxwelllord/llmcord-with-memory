@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 from base64 import b64encode
 from dataclasses import dataclass, field
@@ -91,6 +92,10 @@ def get_config(filename: str = "config.yaml") -> dict[str, Any]:
     with open(filename, encoding="utf-8") as file:
         return yaml.safe_load(file)
 
+
+_parser = argparse.ArgumentParser(description="llmcord Discord bot")
+_parser.add_argument("-c", "--cost", action="store_true", help="Show cost estimates per response")
+cli_args = _parser.parse_args()
 
 config = get_config()
 curr_model = next(iter(config["models"]))
@@ -845,7 +850,7 @@ async def info_command(interaction: discord.Interaction) -> None:
     model_params = cfg["models"].get(curr_model) or {}
     cost_in = model_params.get("cost_per_million_input_tokens")
     cost_out = model_params.get("cost_per_million_output_tokens")
-    if cost_in is not None and cost_out is not None:
+    if cli_args.cost and cost_in is not None and cost_out is not None:
         input_cost = int(total_tokens) * float(cost_in) / 1_000_000
         lines.append(f"Input cost estimate: ~${input_cost:.4f} (${cost_in}/M in, ${cost_out}/M out)")
 
@@ -1027,6 +1032,10 @@ async def on_message(new_msg: discord.Message) -> None:
     if not is_mentioned and not await check_interjection(new_msg, cfg):
         return
 
+    # Discard mentions that arrive while the bot is already composing in this channel
+    if new_msg.channel.id in active_channels:
+        return
+
     # --- Acquire per-channel lock to serialize responses ---
     lock = channel_locks.setdefault(new_msg.channel.id, asyncio.Lock())
     async with lock:
@@ -1163,14 +1172,14 @@ async def on_message(new_msg: discord.Message) -> None:
         # --- Estimate cost and update first response message ---
         cost_input_rate = model_parameters.get("cost_per_million_input_tokens") if model_parameters else None
         cost_output_rate = model_parameters.get("cost_per_million_output_tokens") if model_parameters else None
-        if cost_input_rate is not None and cost_output_rate is not None and response_msgs:
+        if cli_args.cost and cost_input_rate is not None and cost_output_rate is not None and response_msgs:
             input_tokens = sum(estimate_tokens(json.dumps(m.get("content", ""))) for m in ordered_messages)
             input_tokens += estimate_tokens(system_prompt or "")
             output_tokens = estimate_tokens(full_response)
             input_cost = input_tokens * float(cost_input_rate) / 1_000_000
             output_cost = output_tokens * float(cost_output_rate) / 1_000_000
             total_cost = input_cost + output_cost
-            cost_info = f"💰 ~${total_cost:.4f} ({input_tokens:,}in + {output_tokens:,}out)"
+            cost_info = f"~${total_cost:.4f} ({input_tokens:,}in + {output_tokens:,}out)"
             try:
                 first_msg = response_msgs[0]
                 if use_plain_responses:
