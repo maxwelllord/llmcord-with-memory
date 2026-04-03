@@ -15,6 +15,7 @@ from discord.app_commands import Choice
 from discord.ext import commands
 from discord.ui import LayoutView, TextDisplay
 import httpx
+import openai
 from openai import AsyncOpenAI
 import yaml
 
@@ -363,6 +364,9 @@ async def check_interjection(new_msg: discord.Message, cfg: dict) -> bool:
         if should_interject:
             logging.info(f"Interjection approved for message {new_msg.id}")
         return should_interject
+    except openai.RateLimitError as e:
+        logging.warning("Interjection gate rate-limited: %s", e)
+        return False
     except Exception:
         logging.exception("Interjection gate check failed")
         return False
@@ -447,7 +451,7 @@ async def _build_chain_common(
     messages: list[dict] = []
     warnings: set[str] = set()
 
-    context_gap_minutes = cfg.get("context_gap_minutes", 10)
+    context_gap_minutes = cfg.get("context_gap_minutes", 120)
     context_bridge_tokens = cfg.get("context_bridge_tokens", 1000)
 
     recent_msgs, bridge_msgs, _, _, gap_minutes = await _scan_context_messages(
@@ -786,7 +790,7 @@ async def cleanup_old_nodes() -> None:
 async def info_command(interaction: discord.Interaction) -> None:
     cfg = await asyncio.to_thread(get_config)
     max_context_tokens = cfg.get("max_context_tokens", 10000)
-    context_gap_minutes = cfg.get("context_gap_minutes", 10)
+    context_gap_minutes = cfg.get("context_gap_minutes", 120)
     context_bridge_tokens = cfg.get("context_bridge_tokens", 1000)
 
     # --- System prompt + core memory ---
@@ -1057,12 +1061,14 @@ async def on_message(new_msg: discord.Message) -> None:
         emb_client, emb_model = create_embedding_client(cfg)
 
         # --- Memory sweep ---
+        context_gap_minutes = cfg.get("context_gap_minutes", 120)
         channel_injected = session_injected_ids.get(new_msg.channel.id, set())
         new_session = await check_and_run_memory_sweep(
             new_msg, discord_bot.user, openai_client, model,
             injected_ids=channel_injected,
             embedding_model=emb_model,
             embedding_client=emb_client,
+            gap_minutes=context_gap_minutes,
             extra_headers=extra_headers, extra_query=extra_query, extra_body=extra_body,
         )
         if new_session:

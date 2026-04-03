@@ -16,7 +16,6 @@ from semantic_memory import (
 )
 from turn_logger import log_sweep_turn
 
-SESSION_GAP_SECONDS = 2 * 60 * 60  # 2 hours
 MAX_MESSAGES_SANITY = 500
 
 
@@ -114,14 +113,16 @@ async def collect_previous_session(
     channel: discord.abc.Messageable,
     before_msg: discord.Message,
     bot_user: discord.User,
+    gap_minutes: int = 120,
 ) -> list[dict[str, str]]:
     """Fetch the most recent previous session from Discord history.
 
-    Walks backwards from before_msg. The first 2hr+ gap marks the boundary between
-    the current session and the previous one. Once past that gap, collects messages
-    until another 2hr+ gap or the last sweep time is reached.
+    Walks backwards from before_msg. The first gap >= gap_minutes marks the boundary
+    between the current session and the previous one. Once past that gap, collects
+    messages until the last sweep time is reached.
     Returns messages in chronological order.
     """
+    gap_seconds = gap_minutes * 60
     last_sweep = await memory_store.get_last_sweep_time(channel.id)
     session_msgs: list[dict[str, str]] = []
     found_session_start = False
@@ -138,8 +139,8 @@ async def collect_previous_session(
         gap = (prev_time - msg.created_at).total_seconds()
 
         if not found_session_start:
-            # Still in the current session — skip until we cross a 2hr+ gap
-            if gap >= SESSION_GAP_SECONDS:
+            # Still in the current session — skip until we cross a gap
+            if gap >= gap_seconds:
                 found_session_start = True
             else:
                 prev_time = msg.created_at
@@ -273,18 +274,22 @@ async def check_and_run_memory_sweep(
     injected_ids: set[str] | None = None,
     embedding_model: str | None = None,
     embedding_client: AsyncOpenAI | None = None,
+    gap_minutes: int = 120,
     **api_kwargs,
 ) -> bool:
     """Detect a session gap and run a memory sweep on the previous session if needed.
 
     Returns True if a session gap was detected (new session started).
     """
+    gap_seconds = gap_minutes * 60
     try:
         prev_msgs = [m async for m in new_msg.channel.history(limit=1, before=new_msg)]
         if prev_msgs:
             gap = (new_msg.created_at - prev_msgs[0].created_at).total_seconds()
-            if gap >= SESSION_GAP_SECONDS:
-                session_msgs = await collect_previous_session(new_msg.channel, new_msg, bot_user)
+            if gap >= gap_seconds:
+                session_msgs = await collect_previous_session(
+                    new_msg.channel, new_msg, bot_user, gap_minutes=gap_minutes
+                )
                 if session_msgs:
                     await run_memory_sweep(
                         new_msg.channel, session_msgs, openai_client, model,
