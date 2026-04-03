@@ -102,8 +102,12 @@ models:
   openai/gpt-5:
     reasoning_effort: high
     verbosity: medium
+    cost_per_million_input_tokens: 2.00    # USD per 1M input tokens (omit to hide cost estimate)
+    cost_per_million_output_tokens: 8.00   # USD per 1M output tokens
 
   openrouter/x-ai/grok-4-fast:online:
+    cost_per_million_input_tokens: 3.00
+    cost_per_million_output_tokens: 15.00
 
   ollama/llama4:
 
