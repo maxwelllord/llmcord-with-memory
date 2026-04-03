@@ -1174,18 +1174,12 @@ async def on_message(new_msg: discord.Message) -> None:
             try:
                 first_msg = response_msgs[0]
                 if use_plain_responses:
-                    # Plain response: prepend cost to context_info line
+                    # Plain response: replace context_info line with cost appended
                     updated_context = f"-# {context_info}  ·  {cost_info}"
-                    # The first message content starts with "-# context_info\n..."
-                    if first_msg.components:
-                        # LayoutView-based plain response: edit the first component
-                        old_prefix = f"-# {context_info}"
-                        for comp in first_msg.components:
-                            for item in getattr(comp, "children", []):
-                                if hasattr(item, "content") and item.content and item.content.startswith(old_prefix):
-                                    new_content = item.content.replace(old_prefix, updated_context, 1)
-                                    await first_msg.edit(view=LayoutView().add_item(TextDisplay(content=new_content)))
-                                    break
+                    old_prefix = f"-# {context_info}"
+                    # Reconstruct content: the first message starts with "-# context_info\n" + response text
+                    new_content = f"{updated_context}\n{full_response[:4000 - len(updated_context) - 1]}"
+                    await first_msg.edit(view=LayoutView().add_item(TextDisplay(content=new_content)))
                 else:
                     # Embed response: add cost as an embed field
                     if first_msg.embeds:
