@@ -45,7 +45,8 @@ class ResponseFormat(str, Enum):
 class MemoryType(str, Enum):
     """Types of memories that can be retrieved."""
     EPISODIC_MEMORY = "episodic_memory"
-    SEMANTIC_MEMORY = "semantic_memory"
+    FORESIGHT = "foresight"
+    EVENT_LOG = "event_log"
     PROFILE = "profile"
 
 
@@ -154,7 +155,7 @@ class SearchMemoriesInput(BaseModel):
     )
     memory_types: Optional[List[MemoryType]] = Field(
         default=None,
-        description="Types of memories to search: ['episodic_memory', 'semantic_memory', 'profile']. If not specified, searches all types."
+        description="Types of memories to search: 'episodic_memory' (events/episodes), 'foresight' (predictions about user's future behavior), 'event_log' (timeline events). If not specified, defaults to episodic_memory. Use 'foresight' to retrieve Gwen's predictive insights."
     )
     retrieve_method: RetrieveMethod = Field(
         default=RetrieveMethod.HYBRID,
@@ -500,13 +501,23 @@ def format_memories_markdown(memories: List[Dict[str, Any]]) -> str:
             if subject:
                 lines.append(f"**Subject:** {subject}\n")
             
-            # Episode or Summary (the actual memory content)
+            # Memory content — field name varies by memory type
             episode = memory.get('episode')
             summary = memory.get('summary')
-            content = episode or summary
-            
+            foresight = memory.get('foresight')
+            atomic_fact = memory.get('atomic_fact')  # event_log field
+            evidence = memory.get('evidence')
+            content = episode or summary or foresight or atomic_fact
+
             if content:
                 lines.append(f"**Memory:**\n{content}\n")
+            if foresight and evidence:
+                lines.append(f"**Evidence:** {evidence}\n")
+            # Foresight time range
+            start_time = memory.get('start_time')
+            end_time = memory.get('end_time')
+            if start_time and end_time:
+                lines.append(f"**Valid Period:** {start_time} → {end_time}\n")
             
             # Timestamp
             timestamp = memory.get('timestamp')
@@ -606,13 +617,14 @@ evermemos_client = EverMemOSClient()
 async def store_memory(params: StoreMemoryInput, ctx: Context) -> str:
     """Store a conversation message as a memory in EverMemOS.
 
-    This tool stores individual messages in EverMemOS's memory system. The system
-    will automatically extract structured memories, organize them into episodes,
-    and build user profiles over time.
+    **IMPORTANT — CALL THIS AUTOMATICALLY:** You MUST call this tool for every user
+    message in the conversation, without being asked. Also store your own assistant
+    responses. This is how the memory system builds context over time. Do not skip
+    messages or wait for the user to request storage.
 
-    **IMPORTANT:** The API uses 'sender' as the user identifier when storing memories,
-    but uses 'user_id' when searching. Make sure the sender value matches the user_id
-    you'll use when searching.
+    The API uses 'sender' as the user identifier when storing memories, but uses
+    'user_id' when searching. Make sure the sender value matches the user_id you'll
+    use when searching.
 
     Args:
         params (StoreMemoryInput): Memory storage parameters containing:
@@ -710,10 +722,14 @@ async def store_memory(params: StoreMemoryInput, ctx: Context) -> str:
 async def search_memories(params: SearchMemoriesInput, ctx: Context) -> str:
     """Search for relevant memories in EverMemOS using natural language queries.
 
-    This tool searches EverMemOS's memory system using various retrieval methods.
-    It can search episodic memories (specific events), semantic memories (facts),
-    and user profiles. The system uses advanced retrieval combining keyword search,
-    semantic embeddings, and optional LLM-guided retrieval.
+    **IMPORTANT — CALL THIS PROACTIVELY:** Before answering user questions, ALWAYS
+    search for relevant memories first. This provides context from prior conversations.
+    Also search with memory_types=['foresight'] when the user asks about plans,
+    predictions, or future decisions. Do not wait for the user to ask you to recall.
+
+    Supports episodic memories (events/episodes), foresights (predictions about user
+    behavior), and event logs (timeline). Uses advanced retrieval combining keyword
+    search, semantic embeddings, and optional LLM-guided retrieval.
 
     Args:
         params (SearchMemoriesInput): Search parameters containing:
