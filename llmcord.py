@@ -576,6 +576,10 @@ def create_provider_client(cfg: dict, provider_slash_model: str) -> tuple[AsyncO
     extra_headers = provider_config.get("extra_headers")
     extra_query = provider_config.get("extra_query")
     extra_body = (provider_config.get("extra_body") or {}) | model_parameters or None
+    # Strip custom keys that shouldn't be sent to the API
+    _custom_keys = {"cost_per_million_input_tokens", "cost_per_million_output_tokens"}
+    if extra_body:
+        extra_body = {k: v for k, v in extra_body.items() if k not in _custom_keys} or None
 
     return client, model, dict(
         provider=provider,
@@ -836,6 +840,14 @@ async def info_command(interaction: discord.Interaction) -> None:
         lines.append(f"MCP tools ({len(tools)}): ~{tool_tokens:,} tokens")
     lines.append(f"**Total: ~{int(total_tokens):,} / {max_context_tokens:,} tokens**")
     lines.append(f"Earliest message: <t:{earliest_ts}:R>")
+
+    # --- Cost estimate (input only, output unknown) ---
+    model_params = cfg["models"].get(curr_model) or {}
+    cost_in = model_params.get("cost_per_million_input_tokens")
+    cost_out = model_params.get("cost_per_million_output_tokens")
+    if cost_in is not None and cost_out is not None:
+        input_cost = int(total_tokens) * float(cost_in) / 1_000_000
+        lines.append(f"Input cost estimate: ~${input_cost:.4f} (${cost_in}/M in, ${cost_out}/M out)")
 
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
@@ -1147,6 +1159,41 @@ async def on_message(new_msg: discord.Message) -> None:
             response_msgs, full_response = await stream_response(
                 new_msg, openai_client, openai_kwargs, user_warnings, context_info, use_plain_responses,
             )
+
+        # --- Estimate cost and update first response message ---
+        cost_input_rate = model_parameters.get("cost_per_million_input_tokens") if model_parameters else None
+        cost_output_rate = model_parameters.get("cost_per_million_output_tokens") if model_parameters else None
+        if cost_input_rate is not None and cost_output_rate is not None and response_msgs:
+            input_tokens = sum(estimate_tokens(json.dumps(m.get("content", ""))) for m in ordered_messages)
+            input_tokens += estimate_tokens(system_prompt or "")
+            output_tokens = estimate_tokens(full_response)
+            input_cost = input_tokens * float(cost_input_rate) / 1_000_000
+            output_cost = output_tokens * float(cost_output_rate) / 1_000_000
+            total_cost = input_cost + output_cost
+            cost_info = f"💰 ~${total_cost:.4f} ({input_tokens:,}in + {output_tokens:,}out)"
+            try:
+                first_msg = response_msgs[0]
+                if use_plain_responses:
+                    # Plain response: prepend cost to context_info line
+                    updated_context = f"-# {context_info}  ·  {cost_info}"
+                    # The first message content starts with "-# context_info\n..."
+                    if first_msg.components:
+                        # LayoutView-based plain response: edit the first component
+                        old_prefix = f"-# {context_info}"
+                        for comp in first_msg.components:
+                            for item in getattr(comp, "children", []):
+                                if hasattr(item, "content") and item.content and item.content.startswith(old_prefix):
+                                    new_content = item.content.replace(old_prefix, updated_context, 1)
+                                    await first_msg.edit(view=LayoutView().add_item(TextDisplay(content=new_content)))
+                                    break
+                else:
+                    # Embed response: add cost as an embed field
+                    if first_msg.embeds:
+                        embed = first_msg.embeds[0]
+                        embed.set_field_at(len(embed.fields) - 1, name=f"{context_info}  ·  {cost_info}", value="", inline=False)
+                        await first_msg.edit(embed=embed)
+            except Exception:
+                logging.exception("Failed to add cost estimate to response")
 
         # --- Log the full turn ---
         try:
