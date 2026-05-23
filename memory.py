@@ -256,21 +256,24 @@ async def run_memory_sweep(
 
     await channel.send("🧠 Memory formation in progress...")
 
-    # Build prompt inputs
+    # Build prompt inputs. Only memories that were actually surfaced during
+    # the session are loaded into the sweep — feeding the entire store makes
+    # the prompt huge and the sweep slow, and the sweep can only meaningfully
+    # UPDATE/DELETE memories the conversation actually touched.
     core_memory = load_core_memory()
-    active_memories = get_active_memories()
+    injected = injected_ids or set()
+    active_memories = [m for m in get_active_memories() if m["id"] in injected]
     semantic_memories_text = "\n".join(
         f"[{m['id']}] {m['text']}" for m in active_memories
-    ) or "(no entries yet)"
+    ) or "(no entries surfaced this session)"
 
     messages_text = "\n".join(f"[{m['author']}]: {m['content']}" for m in session_msgs)
 
-    # Build injected IDs reference
-    injected = injected_ids or set()
-    if injected:
-        injected_entries = [m for m in active_memories if m["id"] in injected]
+    # Build injected IDs reference (same set as semantic_memories above —
+    # kept as a separate placeholder so the prompt template still resolves).
+    if active_memories:
         injected_ids_text = "\n".join(
-            f"[{m['id']}] {m['text']}" for m in injected_entries
+            f"[{m['id']}] {m['text']}" for m in active_memories
         )
     else:
         injected_ids_text = "(none)"
