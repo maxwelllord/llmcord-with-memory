@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 from base64 import b64encode
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import io
@@ -28,10 +29,22 @@ from memory import check_and_run_memory_sweep, clear_store, collect_since_last_s
 from semantic_memory import load_core_memory, retrieve_memories
 from turn_logger import log_message_turn
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s: %(message)s",
-)
+_log_formatter = logging.Formatter("%(asctime)s %(levelname)s: %(message)s")
+_root_logger = logging.getLogger()
+_root_logger.setLevel(logging.INFO)
+_stderr_h = logging.StreamHandler()
+_stderr_h.setFormatter(_log_formatter)
+_root_logger.addHandler(_stderr_h)
+# Also log to a rotating-ish file so tracebacks survive even when stderr is
+# captured by Docker / the harness and not visible in the user's terminal.
+try:
+    import os
+    _bot_log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.log")
+    _file_h = logging.FileHandler(_bot_log_path, mode="a", encoding="utf-8")
+    _file_h.setFormatter(_log_formatter)
+    _root_logger.addHandler(_file_h)
+except OSError:
+    pass
 
 VISION_MODEL_TAGS = ("claude", "gemini", "gemma", "gpt-4", "gpt-5", "grok-4", "llama", "llava", "mistral", "o3", "o4", "vision", "vl")
 
@@ -665,6 +678,31 @@ def build_system_prompt(cfg: dict) -> str | None:
 # Response streaming
 # ---------------------------------------------------------------------------
 
+@asynccontextmanager
+async def best_effort_typing(channel):
+    """
+    Like channel.typing() but never aborts the surrounding response if Discord
+    rate-limits the typing endpoint. The indicator is purely cosmetic — losing
+    it should not crash the response. Logs a warning and continues if the
+    initial /typing POST gets a 429 (or any HTTPException).
+    """
+    typing = channel.typing()
+    started = False
+    try:
+        try:
+            await typing.__aenter__()
+            started = True
+        except discord.errors.HTTPException as e:
+            logging.warning(f"Skipping typing indicator (Discord {e.status}): {e.text or e.code}")
+        yield
+    finally:
+        if started:
+            try:
+                await typing.__aexit__(None, None, None)
+            except Exception:
+                logging.exception("Error closing typing context")
+
+
 async def stream_response(
     new_msg: discord.Message,
     openai_client: AsyncOpenAI,
@@ -698,7 +736,7 @@ async def stream_response(
 
     active_channels.add(new_msg.channel.id)
     try:
-        async with new_msg.channel.typing():
+        async with best_effort_typing(new_msg.channel):
             async for chunk in await openai_client.chat.completions.create(**openai_kwargs):
                 if finish_reason is not None:
                     break
@@ -1085,14 +1123,26 @@ async def on_message(new_msg: discord.Message) -> None:
     is_dm = new_msg.channel.type == discord.ChannelType.private
     is_thread = new_msg.channel.type in (discord.ChannelType.public_thread, discord.ChannelType.private_thread)
 
-    if new_msg.author.bot or new_msg.content.startswith("."):
+    # Allow [EMBODIMENT] webhook messages through the bot-author filter —
+    # these are synthesized "user prompts" from the VRChat OSC bridge that
+    # wake the bot in response to avatar touches. Strict check (webhook_id +
+    # prefix) so unrelated bot messages still get filtered.
+    is_embodiment_trigger = (
+        new_msg.webhook_id is not None
+        and "[EMBODIMENT]" in new_msg.content
+    )
+
+    if (new_msg.author.bot and not is_embodiment_trigger) or new_msg.content.startswith("."):
         return
 
     is_mentioned = is_dm or is_thread or discord_bot.user in new_msg.mentions
 
     cfg = await asyncio.to_thread(get_config)
 
-    if not check_permissions(new_msg, cfg):
+    # Embodiment triggers bypass user/role permission checks — they're not
+    # from a real user, they're from the bridge process the user owns. The
+    # webhook URL + the [EMBODIMENT] prefix are the implicit credential.
+    if not is_embodiment_trigger and not check_permissions(new_msg, cfg):
         return
 
     if not is_mentioned and not await check_interjection(new_msg, cfg):
@@ -1433,25 +1483,29 @@ async def stream_response_anthropic(
         iteration = 0
         max_iterations = 10
 
-        while iteration < max_iterations:
-            iteration += 1
-            tool_uses: list[dict] = []
-            iteration_text = ""  # Text produced in this iteration only
+        # One typing context wraps the entire multi-turn response so we don't
+        # re-fire /typing on every tool-use iteration (which trips Discord's
+        # rate limit on long tool-heavy turns). The discord.py typing context
+        # auto-refreshes the indicator every ~9s while open.
+        async with best_effort_typing(new_msg.channel):
+            while iteration < max_iterations:
+                iteration += 1
+                tool_uses: list[dict] = []
+                iteration_text = ""  # Text produced in this iteration only
 
-            # Build API kwargs, only including system/tools when present
-            create_kwargs: dict[str, Any] = dict(
-                model=model,
-                messages=conversation_messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                stream=True,
-            )
-            if system:
-                create_kwargs["system"] = system
-            if tools:
-                create_kwargs["tools"] = tools
+                # Build API kwargs, only including system/tools when present
+                create_kwargs: dict[str, Any] = dict(
+                    model=model,
+                    messages=conversation_messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    stream=True,
+                )
+                if system:
+                    create_kwargs["system"] = system
+                if tools:
+                    create_kwargs["tools"] = tools
 
-            async with new_msg.channel.typing():
                 stream = await anthropic_client.messages.create(**create_kwargs)
 
                 async for event in stream:
@@ -1510,52 +1564,52 @@ async def stream_response_anthropic(
                             if tool_uses:
                                 tool_uses[-1]["input_json"] += event.delta.partial_json
 
-            # Parse accumulated JSON inputs for tool calls
-            for tool_use in tool_uses:
-                raw = tool_use.pop("input_json")
-                try:
-                    tool_use["input"] = json.loads(raw) if raw else {}
-                except json.JSONDecodeError:
-                    tool_use["input"] = {}
+                # Parse accumulated JSON inputs for tool calls
+                for tool_use in tool_uses:
+                    raw = tool_use.pop("input_json")
+                    try:
+                        tool_use["input"] = json.loads(raw) if raw else {}
+                    except json.JSONDecodeError:
+                        tool_use["input"] = {}
 
-            # Finalize current text in embed (mark complete or in-progress)
-            if not use_plain_responses and response_contents and response_contents[-1] and response_msgs:
-                embed.description = response_contents[-1]
-                embed.color = EMBED_COLOR_COMPLETE if not tool_uses else EMBED_COLOR_INCOMPLETE
-                await response_msgs[-1].edit(embed=embed)
+                # Finalize current text in embed (mark complete or in-progress)
+                if not use_plain_responses and response_contents and response_contents[-1] and response_msgs:
+                    embed.description = response_contents[-1]
+                    embed.color = EMBED_COLOR_COMPLETE if not tool_uses else EMBED_COLOR_INCOMPLETE
+                    await response_msgs[-1].edit(embed=embed)
 
-            # If no tool uses, we're done
-            if not tool_uses:
-                break
+                # If no tool uses, we're done
+                if not tool_uses:
+                    break
 
-            # Execute MCP tools
-            logging.info(f"Executing {len(tool_uses)} MCP tools: {[t['name'] for t in tool_uses]}")
+                # Execute MCP tools
+                logging.info(f"Executing {len(tool_uses)} MCP tools: {[t['name'] for t in tool_uses]}")
 
-            # Build assistant message with text + tool_use blocks
-            assistant_content = []
-            if iteration_text:
-                assistant_content.append({"type": "text", "text": iteration_text})
-            for tool_use in tool_uses:
-                assistant_content.append({
-                    "type": "tool_use",
-                    "id": tool_use["id"],
-                    "name": tool_use["name"],
-                    "input": tool_use["input"],
-                })
+                # Build assistant message with text + tool_use blocks
+                assistant_content = []
+                if iteration_text:
+                    assistant_content.append({"type": "text", "text": iteration_text})
+                for tool_use in tool_uses:
+                    assistant_content.append({
+                        "type": "tool_use",
+                        "id": tool_use["id"],
+                        "name": tool_use["name"],
+                        "input": tool_use["input"],
+                    })
 
-            conversation_messages.append({"role": "assistant", "content": assistant_content})
+                conversation_messages.append({"role": "assistant", "content": assistant_content})
 
-            # Call MCP tools and collect results
-            tool_results = []
-            for tool_use in tool_uses:
-                result = await mcp_client.call_tool(tool_use["name"], tool_use["input"])
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": tool_use["id"],
-                    "content": result,
-                })
+                # Call MCP tools and collect results
+                tool_results = []
+                for tool_use in tool_uses:
+                    result = await mcp_client.call_tool(tool_use["name"], tool_use["input"])
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use["id"],
+                        "content": result,
+                    })
 
-            conversation_messages.append({"role": "user", "content": tool_results})
+                conversation_messages.append({"role": "user", "content": tool_results})
 
         # Send plain response messages if needed
         if use_plain_responses and response_contents:
